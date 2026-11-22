@@ -34,7 +34,7 @@ async def lifespan(_app: FastAPI):
     print(f"  Local:    http://localhost:{config.PORT}/api/health")
     print(f"  LAN:      http://{info.lan_ip}:{config.PORT}/api/health")
     print(f"  Subnet allowed: {info.subnet}")
-    print(f"  Database: {config.DATABASE_PATH}")
+    print(f"  Database: {config.DATABASE_SUMMARY}")
     if config.FRONTEND_DIST_DIR.exists():
         print(f"  Serving built frontend at http://{info.lan_ip}:{config.PORT}/")
     print(f"{bar}\n", flush=True)

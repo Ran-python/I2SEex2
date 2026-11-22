@@ -7,6 +7,23 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from urllib.parse import urlsplit
+
+from dotenv import load_dotenv
+
+BASE_DIR = Path(__file__).resolve().parent.parent          # ./backend
+PROJECT_DIR = BASE_DIR.parent                               # ./
+FRONTEND_DIST_DIR = PROJECT_DIR / "frontend" / "dist"
+
+# Load environment variables from backend/.env*, ./.env.local, and ./.env
+for _env_file in (
+    BASE_DIR / ".env.local",
+    BASE_DIR / ".env",
+    PROJECT_DIR / ".env.local",
+    PROJECT_DIR / ".env",
+):
+    if _env_file.is_file():
+        load_dotenv(_env_file, override=False)
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -16,9 +33,29 @@ def _env_bool(name: str, default: bool) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
-BASE_DIR = Path(__file__).resolve().parent.parent          # ./backend
-PROJECT_DIR = BASE_DIR.parent                               # ./
-FRONTEND_DIST_DIR = PROJECT_DIR / "frontend" / "dist"
+def normalize_database_url(raw_url: str | None) -> str:
+    """Normalize a PostgreSQL or SQLite URL for SQLAlchemy 2.x + psycopg v3."""
+    if not raw_url:
+        return f"sqlite:///{DATABASE_PATH.as_posix()}"
+    url = raw_url.strip().strip('"').strip("'")
+    if url.startswith("postgres://"):
+        url = "postgresql+psycopg://" + url[len("postgres://"):]
+    elif url.startswith("postgresql://"):
+        url = "postgresql+psycopg://" + url[len("postgresql://"):]
+    return url
+
+
+def summarize_database_url(url: str) -> str:
+    if url.startswith("sqlite"):
+        return f"SQLite ({DATABASE_PATH})"
+    try:
+        parts = urlsplit(url)
+        host = parts.hostname or "postgres"
+        db_name = (parts.path or "").lstrip("/") or "postgres"
+        return f"Neon PostgreSQL ({host}/{db_name})"
+    except Exception:
+        return "Neon PostgreSQL"
+
 
 # --- Server ---------------------------------------------------------------
 HOST = os.getenv("HOST", "0.0.0.0")                       # bind to every interface -> reachable over LAN
@@ -27,7 +64,10 @@ DEFAULT_FRONTEND_PORT = int(os.getenv("FRONTEND_PORT", "5173"))
 
 # --- Database -------------------------------------------------------------
 DATABASE_PATH = Path(os.getenv("DATABASE_PATH", str(BASE_DIR / "attendance.db")))
-DATABASE_URL = f"sqlite:///{DATABASE_PATH.as_posix()}"
+RAW_DATABASE_URL = os.getenv("DATABASE_URL") or os.getenv("POSTGRES_URL") or os.getenv("NEON_DATABASE_URL")
+DATABASE_URL = normalize_database_url(RAW_DATABASE_URL)
+IS_POSTGRES = DATABASE_URL.startswith("postgresql")
+DATABASE_SUMMARY = summarize_database_url(DATABASE_URL)
 
 # --- Attendance rules -----------------------------------------------------
 SESSION_DURATION_SECONDS = int(os.getenv("SESSION_DURATION_SECONDS", str(15 * 60)))
