@@ -1,8 +1,9 @@
-// Central list of platform features. The Navbar and the router are both driven
-// by this registry, so enabling an upcoming feature = flipping `ready` and
-// pointing `component` at its page.
+// Central list of platform features (Phase 2: All 5 features active).
 import AttendancePage from './attendance/AttendancePage.jsx'
-import ComingSoon from '../components/ComingSoon.jsx'
+import CommentsPage from './comments/CommentsPage.jsx'
+import HomeworkReviewPage from './homework/HomeworkReviewPage.jsx'
+import PollsPage from './polls/PollsPage.jsx'
+import LectureSummaryPage from './summary/LectureSummaryPage.jsx'
 
 export const FEATURES = [
   {
@@ -11,44 +12,49 @@ export const FEATURES = [
     label: 'Attendance',
     icon: '✅',
     ready: true,
+    lecturerOnly: false,
     component: AttendancePage,
-    description: 'QR-based attendance tracking restricted to the classroom Wi-Fi.',
+    description: 'QR-based attendance tracking with Wi-Fi subnet lock & AI classroom photo headcount.',
   },
   {
     key: 'comments',
     path: '/comments',
     label: 'Live Comments',
     icon: '💬',
-    ready: false,
-    component: ComingSoon,
-    description: 'Students send live comments & suggestions during the lecture, anonymously or by name.',
+    ready: true,
+    lecturerOnly: false,
+    component: CommentsPage,
+    description: 'Real-time and offline comments & suggestions with course/lesson tagging, anonymity, and private lecturer notes.',
   },
   {
     key: 'polls',
     path: '/polls',
     label: 'Polls',
     icon: '📊',
-    ready: false,
-    component: ComingSoon,
-    description: 'On-the-spot polls created by the lecturer, with live results.',
+    ready: true,
+    lecturerOnly: false,
+    component: PollsPage,
+    description: 'On-the-spot KISS polls with scannable QR code and live bar-chart results.',
   },
   {
     key: 'summary',
     path: '/summary',
     label: 'Lecture Summary',
     icon: '🧠',
-    ready: false,
-    component: ComingSoon,
-    description: 'Machine-learning generated summary of the lecture.',
+    ready: true,
+    lecturerOnly: true,
+    component: LectureSummaryPage,
+    description: 'Lecturer-only ML lecture video summary and pedagogical evaluation report.',
   },
   {
     key: 'homework',
     path: '/homework',
     label: 'Homework Review',
     icon: '📝',
-    ready: false,
-    component: ComingSoon,
-    description: 'LLM-assisted review and feedback on homework submissions.',
+    ready: true,
+    lecturerOnly: false,
+    component: HomeworkReviewPage,
+    description: 'Deep LLM homework review with peer comparison and lecturer cross-student matrix.',
   },
 ]
 

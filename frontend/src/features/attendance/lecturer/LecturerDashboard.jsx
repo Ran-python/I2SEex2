@@ -47,12 +47,14 @@ function formatLessonHeading(lesson) {
 }
 
 export default function LecturerDashboard() {
-  const { setRole } = useRole()
+  const { setRole, setAiSettingsOpen } = useRole()
   const fileInputRef = useRef(null)
   const newCourseFileRef = useRef(null)
+  const photoInputRef = useRef(null)
 
   const [selectedCourseId, setSelectedCourseId] = useState(null)
   const [selectedLessonId, setSelectedLessonId] = useState(null)
+  const [manualHeadcount, setManualHeadcount] = useState('')
 
   // New Course modal/inline drawer state (with optional roster file upload)
   const [showNewCourse, setShowNewCourse] = useState(false)
@@ -248,6 +250,7 @@ export default function LecturerDashboard() {
       const opened = await api.post('/api/attendance/sessions/open', {
         course_id: course?.id,
         title: nextLessonTitle.trim() || null,
+        base_url: window.location.origin,
         frontend_port: detectFrontendPort(),
       })
       setNextLessonTitle('')
@@ -256,7 +259,7 @@ export default function LecturerDashboard() {
       await refresh()
       showBanner(
         'success',
-        `Opened ${formatLessonHeading(opened)} for "${course?.name}". The course roster is loaded online and ready for QR check-ins.`,
+        `Opened ${formatLessonHeading(opened)} for "${course?.name}". Classroom network lock active (${opened.lecturer_subnet || 'same Wi-Fi /24'}).`,
       )
     } catch (err) {
       showBanner('danger', err.message)
@@ -273,6 +276,7 @@ export default function LecturerDashboard() {
       course_id: course?.id,
       lesson_id: session.id,
       title: session.title,
+      base_url: window.location.origin,
       frontend_port: detectFrontendPort(),
     }
     try {
@@ -286,6 +290,7 @@ export default function LecturerDashboard() {
           reopened = await api.patch(`/api/attendance/lessons/${session.id}`, {
             title: `__REOPEN__:${currentTitle}`,
             reopen: true,
+            base_url: window.location.origin,
             frontend_port: detectFrontendPort(),
           })
         } else {
@@ -511,6 +516,73 @@ export default function LecturerDashboard() {
     }
   }
 
+  const handleToggleNetworkOverride = async (nextChecked) => {
+    if (!session) return
+    setBusyAction('network-override')
+    try {
+      await api.patch(`/api/attendance/lessons/${session.id}/network-override`, {
+        allow_any_network: Boolean(nextChecked),
+      })
+      await refresh()
+      showBanner(
+        nextChecked ? 'info' : 'success',
+        nextChecked
+          ? '⚠️ Demo Override ON: Current session allows check-ins without Wi-Fi IP/ASN restriction.'
+          : '🔒 Strict Classroom Wi-Fi Network Lock restored for current session.',
+      )
+    } catch (err) {
+      showBanner('danger', err.message)
+    } finally {
+      setBusyAction(null)
+    }
+  }
+
+  const handlePhotoUpload = async (event) => {
+    const file = event.target.files?.[0]
+    event.target.value = ''
+    if (!file || !session) return
+    setBusyAction('photo-count')
+    setBanner(null)
+    try {
+      const res = await api.upload(`/api/attendance/lessons/${session.id}/photo-headcount`, file)
+      await refresh()
+      if (res.discrepancy_alert) {
+        showBanner(
+          'danger',
+          `🚨 Discrepancy Alert: ${res.registered_count} students marked present, but only ${res.photo_headcount} counted in "${file.name}" (${res.discrepancy} extra check-ins)!`,
+        )
+      } else {
+        showBanner(
+          'success',
+          `📸 AI Photo Count for ${formatLessonHeading(session)}: ${res.photo_headcount} students counted (registered: ${res.registered_count}).`,
+        )
+      }
+    } catch (err) {
+      showBanner('danger', err.message)
+    } finally {
+      setBusyAction(null)
+    }
+  }
+
+  const handleManualHeadcountSave = async (event) => {
+    event.preventDefault()
+    if (!session) return
+    const val = manualHeadcount === '' ? null : Math.max(0, Number(manualHeadcount))
+    setBusyAction('photo-manual')
+    try {
+      await api.patch(`/api/attendance/lessons/${session.id}/photo-headcount`, {
+        photo_headcount: val,
+        photo_analysis: val !== null ? `Manual headcount verification: ${val} students in room.` : null,
+      })
+      setManualHeadcount('')
+      await refresh()
+    } catch (err) {
+      showBanner('danger', err.message)
+    } finally {
+      setBusyAction(null)
+    }
+  }
+
   const triggerBlobDownload = (blob, filename) => {
     const url = URL.createObjectURL(blob)
     const link = document.createElement('a')
@@ -588,11 +660,11 @@ export default function LecturerDashboard() {
         <div className="network-bar__left">
           <span className="network-pill">
             <span className="status-dot status-dot--live" aria-hidden="true" />
-            Local Wi-Fi Guard Active
+            Classroom Network Lock: <code>{session?.lecturer_subnet || network?.subnet || '127.0.0.0/24'}</code>
           </span>
           {network && (
             <span className="network-meta">
-              Host LAN IP: <code>{network.lan_ip}</code> · Allowed Subnet: <code>{network.subnet}</code>
+              Lecturer IP: <code>{session?.lecturer_ip || network.lecturer_ip || network.lan_ip}</code>
             </span>
           )}
         </div>
@@ -833,6 +905,28 @@ export default function LecturerDashboard() {
         </div>
       )}
 
+      {/* Automatic Discrepancy System Alert (Registered Present > Photo Headcount) */}
+      {session &&
+        session.photo_headcount !== null &&
+        session.photo_headcount !== undefined &&
+        stats.present > session.photo_headcount && (
+          <section className="alerts-panel alerts-panel--danger" role="alert" aria-label="Attendance discrepancy alert">
+            <div className="alerts-panel__header">
+              <span className="alerts-panel__icon" aria-hidden="true">🚨</span>
+              <div>
+                <h2>
+                  Discrepancy Alert: {stats.present} students marked present, but only {session.photo_headcount} students were counted in the classroom photo —{' '}
+                  {stats.present - session.photo_headcount} extra check-in(s) detected!
+                </h2>
+                <p>
+                  Lesson: <strong>{formatLessonHeading(session)}</strong>
+                  {session.photo_analysis ? ` · ${session.photo_analysis}` : ''}
+                </p>
+              </div>
+            </div>
+          </section>
+        )}
+
       {/* System Alerts for Newly Registered Students (Auto-Added to Course Roster) */}
       {alerts.length > 0 && (
         <section className="alerts-panel" aria-label="New student registration alerts">
@@ -996,6 +1090,58 @@ export default function LecturerDashboard() {
               </form>
             </div>
           )}
+
+          {/* Live Network Diagnostic & Demo Override Box */}
+          <div className="qr-url-box" style={{ marginTop: '1rem' }} aria-label="Network Diagnostic Box">
+            <span className="qr-url-box__label">📡 Live Network & Cloudflare Tunnel Diagnostic</span>
+            <div style={{ display: 'grid', gap: '0.3rem', fontSize: '0.88rem', marginTop: '0.25rem' }}>
+              <div>
+                <strong>QR Code URL:</strong>{' '}
+                <code>{session?.checkin_url || `${window.location.origin}/attendance/checkin?token=...`}</code>
+              </div>
+              <div>
+                <strong>Lecturer Detected Request IP:</strong>{' '}
+                <code>{network?.detected_request_ip || session?.lecturer_ip || network?.lan_ip || '127.0.0.1'}</code>
+                {' · '}
+                <strong>Local LAN IP:</strong> <code>{network?.lan_ip || '127.0.0.1'}</code>
+              </div>
+              <div>
+                <strong>Lecturer Public IP (Router / Tunnel):</strong>{' '}
+                <code>{network?.public_ip || session?.lecturer_ip || 'Detecting…'}</code>
+                {' · '}
+                <strong>Active Subnet Lock:</strong>{' '}
+                <code>{network?.subnet || session?.lecturer_subnet || '127.0.0.0/24'}</code>
+              </div>
+              <div>
+                <strong>ISP / Organization ASN:</strong>{' '}
+                <code>
+                  {network?.asn ? `${network.asn}${network?.org ? ` (${network.org})` : ''}` : 'Local LAN'}
+                </code>
+              </div>
+            </div>
+
+            {session && (
+              <label
+                className="checkbox-label"
+                style={{
+                  marginTop: '0.65rem',
+                  paddingTop: '0.55rem',
+                  borderTop: '1px solid rgba(148, 163, 184, 0.25)',
+                }}
+              >
+                <input
+                  type="checkbox"
+                  checked={Boolean(network?.allow_any_network)}
+                  disabled={busyAction === 'network-override'}
+                  onChange={(e) => handleToggleNetworkOverride(e.target.checked)}
+                />
+                <span>
+                  <strong>Demo Override: Allow Current Session Without IP Check</strong>{' '}
+                  <span className="muted">(Safety net for live class presentation; off by default)</span>
+                </span>
+              </label>
+            )}
+          </div>
         </section>
 
         {/* Right Column: Stats, Roster Import/Export & Manual Add Student */}
@@ -1020,6 +1166,86 @@ export default function LecturerDashboard() {
               <span className="stat-card__label">Joined via QR</span>
               <strong className="stat-card__value">{stats.unlisted}</strong>
             </div>
+          </section>
+
+          {/* Classroom Photo Headcount & Discrepancy Check Card */}
+          <section className="card">
+            <div className="card__header">
+              <div>
+                <h2>📸 Classroom Photo Headcount (AI Vision)</h2>
+                <p className="muted">
+                  Upload a photo of the lecture hall to automatically count seated students via Vision LLM and detect remote/proxy check-ins.
+                </p>
+              </div>
+              {session && session.photo_headcount !== null && session.photo_headcount !== undefined && (
+                <span
+                  className={`badge ${
+                    stats.present > session.photo_headcount ? 'badge--danger' : 'badge--success'
+                  }`}
+                >
+                  Photo: {session.photo_headcount} vs. Present: {stats.present}
+                </span>
+              )}
+            </div>
+
+            <input
+              ref={photoInputRef}
+              type="file"
+              accept="image/jpeg,image/png,image/webp,.jpg,.jpeg,.png,.webp"
+              onChange={handlePhotoUpload}
+              hidden
+            />
+
+            <div className="btn-row">
+              <button
+                type="button"
+                className="btn btn--primary"
+                disabled={!session || busyAction === 'photo-count'}
+                onClick={() => photoInputRef.current?.click()}
+              >
+                {busyAction === 'photo-count'
+                  ? '🤖 Counting Students in Photo…'
+                  : '📷 Upload Classroom Photo (.jpg / .png)'}
+              </button>
+              <button
+                type="button"
+                className="btn btn--ghost btn--sm"
+                onClick={() => setAiSettingsOpen(true)}
+              >
+                ⚙️ Configure Vision API Key
+              </button>
+            </div>
+
+            {session && (
+              <form className="context-subform" style={{ marginTop: '0.75rem' }} onSubmit={handleManualHeadcountSave}>
+                <span className="context-subform__tag">Or set headcount manually:</span>
+                <input
+                  type="number"
+                  min={0}
+                  max={1000}
+                  placeholder={
+                    session.photo_headcount !== null && session.photo_headcount !== undefined
+                      ? `Current: ${session.photo_headcount}`
+                      : 'Enter headcount (e.g. 25)'
+                  }
+                  value={manualHeadcount}
+                  onChange={(e) => setManualHeadcount(e.target.value)}
+                />
+                <button
+                  type="submit"
+                  className="btn btn--secondary btn--sm"
+                  disabled={busyAction === 'photo-manual'}
+                >
+                  Apply Count
+                </button>
+              </form>
+            )}
+
+            {session?.photo_analysis && (
+              <p className="muted" style={{ marginTop: '0.6rem' }}>
+                <strong>Last Count Result:</strong> {session.photo_analysis}
+              </p>
+            )}
           </section>
 
           {/* Roster Import & Session Export */}

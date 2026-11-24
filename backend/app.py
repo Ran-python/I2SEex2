@@ -4,25 +4,36 @@ Run (from ./backend, with the venv active):
     python app.py
 or
     uvicorn app:app --host 0.0.0.0 --port 8000
-
-The server binds to 0.0.0.0 so students on the same Wi-Fi can reach it via the
-lecturer's LAN IP. Students on any other network cannot reach it at all.
 """
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
 
 import uvicorn
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
 
 from core import config
+from core.ai import AIError, extract_ai_config, list_provider_models, test_ai_connection
 from core.database import init_db
-from core.network import LanGuardMiddleware, get_client_ip, get_network_info, is_host_ip
+from core.network import (
+    LanGuardMiddleware,
+    compute_subnet,
+    detect_host_public_ip,
+    get_client_ip,
+    get_network_info,
+    is_host_ip,
+    lookup_ip_asn,
+)
 from modules.attendance.router import router as attendance_router
+from modules.comments.router import router as comments_router
+from modules.homework.router import router as homework_router
+from modules.polls.router import router as polls_router
 from modules.roster.router import router as roster_router
+from modules.summary.router import router as summary_router
 
 
 @asynccontextmanager
@@ -33,7 +44,8 @@ async def lifespan(_app: FastAPI):
     print(f"\n{bar}\n  Teaching Platform API")
     print(f"  Local:    http://localhost:{config.PORT}/api/health")
     print(f"  LAN:      http://{info.lan_ip}:{config.PORT}/api/health")
-    print(f"  Subnet allowed: {info.subnet}")
+    if config.PUBLIC_APP_URL:
+        print(f"  Public:   {config.PUBLIC_APP_URL}")
     print(f"  Database: {config.DATABASE_SUMMARY}")
     if config.FRONTEND_DIST_DIR.exists():
         print(f"  Serving built frontend at http://{info.lan_ip}:{config.PORT}/")
@@ -41,18 +53,12 @@ async def lifespan(_app: FastAPI):
     yield
 
 
-app = FastAPI(title="Teaching Platform API", version="1.0.0", lifespan=lifespan)
+app = FastAPI(title="Teaching Platform API", version="2.0.0", lifespan=lifespan)
 
-# Middleware order: the last added runs first. CORS wraps the LAN guard so even
-# 403 responses carry CORS headers.
 app.add_middleware(LanGuardMiddleware)
 app.add_middleware(
     CORSMiddleware,
-    # localhost + private LAN ranges (10.x, 172.16-31.x, 192.168.x) on any port.
-    allow_origin_regex=(
-        r"^https?://(localhost|127\.0\.0\.1|10(\.\d{1,3}){3}|192\.168(\.\d{1,3}){2}"
-        r"|172\.(1[6-9]|2\d|3[01])(\.\d{1,3}){2})(:\d+)?$"
-    ),
+    allow_origin_regex=r"^https?://.*$",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -60,6 +66,20 @@ app.add_middleware(
 
 app.include_router(roster_router)
 app.include_router(attendance_router)
+app.include_router(comments_router)
+app.include_router(polls_router)
+app.include_router(summary_router)
+app.include_router(homework_router)
+
+
+class PinVerifyRequest(BaseModel):
+    pin: str
+
+
+class AITestRequest(BaseModel):
+    provider: str | None = None
+    api_key: str | None = None
+    model: str | None = None
 
 
 @app.get("/api/health")
@@ -67,13 +87,53 @@ def health():
     return {"ok": True}
 
 
+@app.post("/api/auth/verify-pin")
+def verify_lecturer_pin(payload: PinVerifyRequest):
+    if (payload.pin or "").strip() != config.LECTURER_PIN:
+        raise HTTPException(status_code=403, detail="Incorrect Lecturer PIN. Access denied.")
+    return {"ok": True}
+
+
+@app.get("/api/ai/models")
+def ai_models(request: Request, provider: str | None = None, api_key: str | None = None, refresh: bool = False):
+    try:
+        cfg = extract_ai_config(
+            request,
+            provider_override=provider,
+            api_key_override=api_key,
+        )
+        return list_provider_models(cfg, force_refresh=refresh)
+    except AIError as exc:
+        return JSONResponse(status_code=exc.status_code, content={"detail": exc.message})
+
+
+@app.post("/api/ai/test")
+def ai_test(payload: AITestRequest, request: Request):
+    try:
+        cfg = extract_ai_config(
+            request,
+            provider_override=payload.provider,
+            api_key_override=payload.api_key,
+            model_override=payload.model,
+        )
+        return test_ai_connection(cfg)
+    except AIError as exc:
+        return JSONResponse(status_code=exc.status_code, content={"detail": exc.message})
+
+
 @app.get("/api/network")
 def network(request: Request):
     info = get_network_info()
     client_ip = get_client_ip(request)
+    public_ip = detect_host_public_ip()
+    asn_info = lookup_ip_asn(public_ip or client_ip)
     return {
         "lan_ip": info.lan_ip,
-        "subnet": str(info.subnet),
+        "lecturer_ip": client_ip,
+        "public_ip": public_ip,
+        "subnet": compute_subnet(public_ip or client_ip),
+        "asn": asn_info.get("asn"),
+        "org": asn_info.get("org"),
         "backend_port": config.PORT,
         "client_ip": client_ip,
         "is_lecturer_host": is_host_ip(client_ip),

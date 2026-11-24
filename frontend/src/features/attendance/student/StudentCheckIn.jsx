@@ -1,5 +1,6 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { api } from '../../../api/client.js'
+import { useRole } from '../../../context/RoleContext.jsx'
 import { formatClock, formatDuration, useCountdown } from '../../../hooks/useCountdown.js'
 import { usePolling } from '../../../hooks/usePolling.js'
 import { getDeviceIdentity } from '../fingerprint.js'
@@ -44,23 +45,80 @@ function LockNotice({ seconds, syncKey }) {
   )
 }
 
+function StudentNetworkDiagnostic({ diag }) {
+  if (!diag) return null
+  const asnLabel = diag.student_asn
+    ? `${diag.student_asn}${diag.student_org ? ` (${diag.student_org})` : ''}`
+    : 'Detecting…'
+  return (
+    <div
+      className="qr-url-box"
+      style={{ marginTop: '1rem', textAlign: 'left', fontSize: '0.84rem' }}
+      aria-label="Student Network Diagnostic Box"
+    >
+      <span className="qr-url-box__label">📡 Your Network Diagnostic</span>
+      <div style={{ display: 'grid', gap: '0.2rem', marginTop: '0.2rem' }}>
+        <div>
+          <strong>Your Detected IP:</strong> <code>{diag.student_ip || 'Unknown'}</code>
+        </div>
+        <div>
+          <strong>Your ISP / ASN:</strong> <code>{asnLabel}</code>
+        </div>
+        {diag.lecturer_subnet && (
+          <div>
+            <strong>Classroom Network:</strong>{' '}
+            <code>
+              {diag.lecturer_subnet}
+              {diag.lecturer_asn ? ` · ${diag.lecturer_asn}` : ''}
+            </code>
+          </div>
+        )}
+        {diag.verification_reason && (
+          <div>
+            <strong>Network Verification:</strong>{' '}
+            <span className={diag.same_classroom_network ? 'badge badge--success' : 'badge badge--warning'}>
+              {diag.verification_reason}
+            </span>
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
+
 export default function StudentCheckIn({ urlToken }) {
-  const [form, setForm] = useState({ full_name: '', id_number: '', email: '' })
+  const { studentIdentity } = useRole()
+  const [form, setForm] = useState({
+    full_name: studentIdentity?.studentName || '',
+    id_number: '',
+    email: '',
+  })
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState(null)
+  const [errorDiag, setErrorDiag] = useState(null)
   const [lock, setLock] = useState(null) // { seconds, at }
   const [success, setSuccess] = useState(null)
 
-  const query = urlToken ? `?token=${encodeURIComponent(urlToken)}` : ''
+  useEffect(() => {
+    if (studentIdentity?.studentName) {
+      setForm((prev) => ({ ...prev, full_name: studentIdentity.studentName }))
+    }
+  }, [studentIdentity?.studentName])
+
+  const effectiveUrlToken =
+    urlToken || new URLSearchParams(window.location.search).get('token') || null
+
+  const query = effectiveUrlToken ? `?token=${encodeURIComponent(effectiveUrlToken)}` : ''
   const { data: status, error: statusError, loading, refresh } = usePolling(
     () => api.get(`/api/attendance/status${query}`),
     5000,
     { enabled: !success },
   )
 
-  const token = urlToken || status?.token || null
-  const tokenUsable = Boolean(status?.active && token && (urlToken ? status.token_valid : true))
+  const token = effectiveUrlToken || status?.token || null
+  const tokenUsable = Boolean(status?.active && token && (effectiveUrlToken ? status.token_valid : true))
   const lockSeconds = lock?.seconds ?? status?.device_lock_seconds ?? 0
+  const activeDiag = errorDiag || status?.network_diagnostic || null
 
   const update = (field) => (event) => setForm((f) => ({ ...f, [field]: event.target.value }))
 
@@ -72,6 +130,7 @@ export default function StudentCheckIn({ urlToken }) {
     }
     setSubmitting(true)
     setError(null)
+    setErrorDiag(null)
     const { fingerprint, deviceId } = getDeviceIdentity()
     try {
       const result = await api.post('/api/attendance/checkin', {
@@ -88,6 +147,13 @@ export default function StudentCheckIn({ urlToken }) {
         setLock({ seconds: err.data?.retry_after_seconds ?? 0, at: Date.now() })
       } else if (err.status === 410) {
         refresh()
+      }
+      if (err.data?.network_diagnostic) {
+        setErrorDiag({
+          ...err.data.network_diagnostic,
+          same_classroom_network: false,
+          verification_reason: err.message,
+        })
       }
       setError(err.message)
     } finally {
@@ -159,13 +225,14 @@ export default function StudentCheckIn({ urlToken }) {
   if (!tokenUsable) {
     return (
       <div className="student-page">
-        <StatusCard icon="📷" title={urlToken ? 'This QR code has expired' : 'Scan the QR code to check in'}>
+        <StatusCard icon="📷" title={effectiveUrlToken ? 'This QR code has expired' : 'Scan the QR code to check in'}>
           <ClassLessonBadge course={status.course} lesson={status.lesson} />
           <p className="muted">
-            {urlToken
+            {effectiveUrlToken
               ? 'Please scan the QR code currently shown on the lecturer’s screen.'
               : 'Use your phone camera to scan the QR code shown on the lecturer’s screen.'}
           </p>
+          <StudentNetworkDiagnostic diag={activeDiag} />
         </StatusCard>
       </div>
     )
@@ -227,7 +294,7 @@ export default function StudentCheckIn({ urlToken }) {
 
         {error && (
           <div className="notice notice--danger" role="alert">
-            {error}
+            <strong>Check-in Rejection Reason:</strong> {error}
             {lock && <LockNotice seconds={lock.seconds} syncKey={lock.at} />}
           </div>
         )}
@@ -235,6 +302,8 @@ export default function StudentCheckIn({ urlToken }) {
         <button type="submit" className="btn btn--primary btn--block btn--lg" disabled={submitting || !!lock}>
           {submitting ? 'Submitting…' : 'Check in'}
         </button>
+
+        <StudentNetworkDiagnostic diag={activeDiag} />
       </form>
     </div>
   )

@@ -33,6 +33,11 @@ class Lesson(Base):
     closed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     qr_token: Mapped[str] = mapped_column(String(64), unique=True, nullable=False, index=True)
     checkin_url: Mapped[str] = mapped_column(String(500), nullable=False)
+    lecturer_ip: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    lecturer_subnet: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    photo_headcount: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    photo_analysis: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+    photo_checked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
     course: Mapped[Course] = relationship(lazy="joined")
 
@@ -65,6 +70,11 @@ class Lesson(Base):
             "qr_token": self.qr_token,
             "token": self.qr_token,
             "checkin_url": self.checkin_url,
+            "lecturer_ip": self.lecturer_ip,
+            "lecturer_subnet": self.lecturer_subnet,
+            "photo_headcount": self.photo_headcount,
+            "photo_analysis": self.photo_analysis,
+            "photo_checked_at": iso_utc(self.photo_checked_at),
             "opened_at": iso_utc(self.opened_at),
             "expires_at": iso_utc(self.expires_at),
             "closed_at": iso_utc(self.closed_at if self.closed_at else (None if active else self.expires_at)),

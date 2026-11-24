@@ -1,5 +1,5 @@
-// Thin fetch wrapper. All calls go to relative /api URLs, which Vite proxies to
-// FastAPI in dev and FastAPI serves directly in single-port mode.
+// Thin fetch wrapper. Attaches device fingerprint, Lecturer PIN (when unlocked),
+// and user-configured AI Provider / API Key headers from localStorage.
 import { getDeviceIdentity } from '../features/attendance/fingerprint.js'
 
 export class ApiError extends Error {
@@ -10,16 +10,52 @@ export class ApiError extends Error {
   }
 }
 
+export function getStoredAiSettings() {
+  try {
+    const raw = localStorage.getItem('ai_settings')
+    if (!raw) return { provider: 'gemini', apiKey: '', model: '' }
+    const parsed = JSON.parse(raw)
+    return {
+      provider: parsed.provider || 'gemini',
+      apiKey: parsed.apiKey || '',
+      model: parsed.model || '',
+    }
+  } catch {
+    return { provider: 'gemini', apiKey: '', model: '' }
+  }
+}
+
+export function getStoredLecturerPin() {
+  try {
+    return sessionStorage.getItem('lecturer_pin') || '3358'
+  } catch {
+    return '3358'
+  }
+}
+
 async function request(method, path, { body, form, headers } = {}) {
   const { fingerprint, deviceId } = getDeviceIdentity()
+  const ai = getStoredAiSettings()
+  const pin = getStoredLecturerPin()
+
+  const reqHeaders = {
+    'X-Device-Fingerprint': fingerprint,
+    'X-Device-Id': deviceId,
+    'X-Lecturer-Pin': pin,
+    'X-AI-Provider': ai.provider || 'gemini',
+    ...headers,
+  }
+  if (ai.apiKey) {
+    reqHeaders['X-AI-Api-Key'] = ai.apiKey
+  }
+  if (ai.model) {
+    reqHeaders['X-AI-Model'] = ai.model
+  }
+
   const init = {
     method,
-    credentials: 'include', // send/receive the HttpOnly device_lock_token cookie
-    headers: {
-      'X-Device-Fingerprint': fingerprint,
-      'X-Device-Id': deviceId,
-      ...headers,
-    },
+    credentials: 'include',
+    headers: reqHeaders,
   }
   if (form) {
     init.body = form
@@ -32,26 +68,27 @@ async function request(method, path, { body, form, headers } = {}) {
   try {
     response = await fetch(path, init)
   } catch {
-    throw new ApiError(0, 'Cannot reach the server. Are you connected to the classroom Wi-Fi?')
+    throw new ApiError(0, 'Cannot reach the server. Please check your connection.')
   }
   const isJson = response.headers.get('content-type')?.includes('application/json')
   const data = isJson ? await response.json() : null
   if (!response.ok) {
     let message = data?.detail
-    if (Array.isArray(message)) message = message.map((d) => d.msg).join(', ') // FastAPI validation errors
+    if (Array.isArray(message)) message = message.map((d) => d.msg).join(', ')
     throw new ApiError(response.status, message || `Request failed (${response.status})`, data)
   }
   return data
 }
 
 export const api = {
-  get: (path) => request('GET', path),
-  post: (path, body) => request('POST', path, { body }),
-  patch: (path, body) => request('PATCH', path, { body }),
-  del: (path) => request('DELETE', path),
+  get: (path, options) => request('GET', path, options),
+  post: (path, body, options) => request('POST', path, { ...options, body }),
+  patch: (path, body, options) => request('PATCH', path, { ...options, body }),
+  del: (path, options) => request('DELETE', path, options),
   upload: (path, file) => {
     const form = new FormData()
     form.append('file', file)
     return request('POST', path, { form })
   },
+  uploadForm: (path, formData) => request('POST', path, { form: formData }),
 }

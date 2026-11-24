@@ -60,38 +60,62 @@ function webglSignature() {
 }
 
 export function computeFingerprint() {
-  const nav = window.navigator
-  const parts = [
-    nav.userAgent,
-    nav.language,
-    (nav.languages || []).join(','),
-    nav.platform,
-    nav.hardwareConcurrency,
-    nav.deviceMemory,
-    nav.maxTouchPoints,
-    `${window.screen.width}x${window.screen.height}x${window.screen.colorDepth}`,
-    window.devicePixelRatio,
-    Intl.DateTimeFormat().resolvedOptions().timeZone,
-    new Date().getTimezoneOffset(),
-    canvasSignature(),
-    webglSignature(),
-  ]
-  const raw = parts.join('||')
-  return `fp_${cyrb53(raw, 1)}${cyrb53(raw, 2)}`
+  try {
+    const nav = window.navigator || {}
+    const scr = window.screen || { width: 0, height: 0, colorDepth: 0 }
+    let tz = 'UTC'
+    try {
+      tz = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC'
+    } catch {
+      tz = 'UTC'
+    }
+    const parts = [
+      nav.userAgent || 'ua',
+      nav.language || 'en',
+      (nav.languages || []).join(','),
+      nav.platform || '',
+      nav.hardwareConcurrency || '',
+      nav.deviceMemory || '',
+      nav.maxTouchPoints || '',
+      `${scr.width}x${scr.height}x${scr.colorDepth}`,
+      window.devicePixelRatio || 1,
+      tz,
+      new Date().getTimezoneOffset(),
+      canvasSignature(),
+      webglSignature(),
+    ]
+    const raw = parts.join('||')
+    return `fp_${cyrb53(raw, 1)}${cyrb53(raw, 2)}`
+  } catch {
+    return `fp_fallback_${randomId()}`
+  }
 }
 
 function randomId() {
-  const bytes = new Uint8Array(16)
-  window.crypto.getRandomValues(bytes) // available in insecure contexts too
-  return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('')
+  try {
+    if (window.crypto && typeof window.crypto.getRandomValues === 'function') {
+      const bytes = new Uint8Array(16)
+      window.crypto.getRandomValues(bytes)
+      return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('')
+    }
+  } catch {
+    /* fallback below */
+  }
+  let out = ''
+  for (let i = 0; i < 32; i++) {
+    out += Math.floor(Math.random() * 16).toString(16)
+  }
+  return out
 }
 
 let cached = null
 
 export function getDeviceIdentity() {
-  if (cached) return cached
-  // Always recompute (deterministic) so editing localStorage can't spoof it.
-  const fingerprint = computeFingerprint()
+  if (cached && cached.fingerprint && cached.deviceId) return cached
+  let fingerprint = computeFingerprint()
+  if (!fingerprint || fingerprint.length < 8) {
+    fingerprint = `fp_${randomId()}`
+  }
   let deviceId = null
   try {
     localStorage.setItem(FP_KEY, fingerprint)

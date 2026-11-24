@@ -1,8 +1,12 @@
+import { useRole } from '../context/RoleContext.jsx'
 import { FEATURES } from '../features/registry.js'
 import { Link } from '../router.jsx'
 import RoleSwitcher from './RoleSwitcher.jsx'
 
 export default function Navbar({ activeKey }) {
+  const { isLecturer } = useRole()
+  const visibleFeatures = FEATURES.filter((f) => !f.lecturerOnly || isLecturer)
+
   return (
     <header className="navbar">
       <div className="navbar__top">
@@ -13,7 +17,7 @@ export default function Navbar({ activeKey }) {
         <RoleSwitcher />
       </div>
       <nav className="navbar__tabs" aria-label="Features">
-        {FEATURES.map((feature) => (
+        {visibleFeatures.map((feature) => (
           <Link
             key={feature.key}
             to={feature.path}
@@ -22,7 +26,9 @@ export default function Navbar({ activeKey }) {
           >
             <span aria-hidden="true">{feature.icon}</span>
             <span>{feature.label}</span>
-            {!feature.ready && <span className="badge badge--soon badge--tiny">Soon</span>}
+            {feature.lecturerOnly && (
+              <span className="badge badge--info badge--tiny">Lecturer</span>
+            )}
           </Link>
         ))}
       </nav>

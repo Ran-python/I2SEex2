@@ -26,8 +26,8 @@ from modules.roster.service import (
     upsert_student,
 )
 
-# All endpoints in this router require lecturer host access (students cannot access or modify roster/presence).
-router = APIRouter(tags=["roster"], dependencies=[Depends(require_lecturer_host)])
+router = APIRouter(tags=["roster"])
+lecturer = [Depends(require_lecturer_host)]
 
 MAX_UPLOAD_BYTES = 5 * 1024 * 1024
 
@@ -35,10 +35,11 @@ MAX_UPLOAD_BYTES = 5 * 1024 * 1024
 # ---------------------------------------------------------------- courses
 @router.get("/api/courses")
 def get_courses(db: Session = Depends(get_db)):
+    """Public list of courses (used by both Lecturer Dashboard and Student Quick-Login bar)."""
     return list_courses(db)
 
 
-@router.post("/api/courses")
+@router.post("/api/courses", dependencies=lecturer)
 def add_course(payload: CourseCreate, db: Session = Depends(get_db)):
     try:
         course = create_course(db, payload.name)
@@ -51,7 +52,7 @@ def add_course(payload: CourseCreate, db: Session = Depends(get_db)):
     }
 
 
-@router.delete("/api/courses/{course_id}")
+@router.delete("/api/courses/{course_id}", dependencies=lecturer)
 def remove_course(course_id: int, db: Session = Depends(get_db)):
     """Lecturer-only endpoint to delete a course and all its lessons/roster."""
     try:
@@ -64,6 +65,7 @@ def remove_course(course_id: int, db: Session = Depends(get_db)):
 # ---------------------------------------------------------------- students
 @router.get("/api/students")
 def list_students(course_id: int | None = Query(default=None), db: Session = Depends(get_db)):
+    """Public list of students in a course (used by Student Quick-Login dropdown and Lecturer view)."""
     course = resolve_course(db, course_id)
     return [
         s.to_dict()
@@ -75,7 +77,7 @@ def list_students(course_id: int | None = Query(default=None), db: Session = Dep
     ]
 
 
-@router.post("/api/students")
+@router.post("/api/students", dependencies=lecturer)
 def add_student(payload: StudentCreate, db: Session = Depends(get_db)):
     course = resolve_course(db, payload.course_id)
     name = clean_text(payload.full_name)
@@ -104,7 +106,7 @@ def add_student(payload: StudentCreate, db: Session = Depends(get_db)):
     return {"student": student.to_dict(), "created": created, "marked_present": marked}
 
 
-@router.patch("/api/students/{student_id}")
+@router.patch("/api/students/{student_id}", dependencies=lecturer)
 def update_student(
     student_id: int,
     payload: StudentUpdate,
@@ -128,7 +130,7 @@ def update_student(
     return {"ok": True, "student": student.to_dict()}
 
 
-@router.delete("/api/students/{student_id}")
+@router.delete("/api/students/{student_id}", dependencies=lecturer)
 def delete_student(student_id: int, db: Session = Depends(get_db)):
     """Lecturer-only endpoint to remove a student from the course roster."""
     student = db.get(Student, student_id)
@@ -139,7 +141,7 @@ def delete_student(student_id: int, db: Session = Depends(get_db)):
     return {"ok": True}
 
 
-@router.patch("/api/students/{student_id}/presence")
+@router.patch("/api/students/{student_id}/presence", dependencies=lecturer)
 def update_student_presence(
     student_id: int,
     payload: StudentPresenceUpdate,
@@ -159,7 +161,7 @@ def update_student_presence(
     return {"ok": True, "student": student.to_dict()}
 
 
-@router.post("/api/students/import")
+@router.post("/api/students/import", dependencies=lecturer)
 async def import_roster(
     file: UploadFile = File(...),
     course_id: int | None = Query(default=None),

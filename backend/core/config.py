@@ -78,13 +78,23 @@ DEVICE_LOCK_COOKIE = "device_lock_token"
 # 15 minutes even if cookies/localStorage are cleared or incognito is used.
 STRICT_FINGERPRINT_LOCK = _env_bool("STRICT_FINGERPRINT_LOCK", True)
 
+# Lecturer PIN for role access control (default: 3358)
+LECTURER_PIN = os.getenv("LECTURER_PIN", "3358").strip() or "3358"
+
+# Optional fallback AI keys from environment
+GEMINI_API_KEY = (os.getenv("GEMINI_API_KEY") or "").strip() or None
+ANTHROPIC_API_KEY = (os.getenv("ANTHROPIC_API_KEY") or "").strip() or None
+OPENAI_API_KEY = (os.getenv("OPENAI_API_KEY") or "").strip() or None
+
 # --- Network security -----------------------------------------------------
+# Optional public base URL for QR codes (e.g. https://my-app.onrender.com).
+# When unset, the backend uses the origin URL passed by the lecturer's browser or Host headers.
+PUBLIC_APP_URL = (os.getenv("PUBLIC_APP_URL") or "").strip().rstrip("/") or None
 # Override the auto-detected LAN IP (useful with multiple adapters / VPNs).
 LAN_IP_OVERRIDE = os.getenv("LAN_IP") or None
 # Extra CIDR ranges that are allowed to reach the API, comma separated.
 EXTRA_ALLOWED_SUBNETS = [s.strip() for s in os.getenv("ALLOWED_SUBNETS", "").split(",") if s.strip()]
-# Lecturer-only endpoints (open/close session, import, export...) are accepted
-# only from the lecturer's own computer.
-LECTURER_HOST_ONLY = _env_bool("LECTURER_HOST_ONLY", True)
+# Lecturer-only endpoints (disabled by default for cloud/tunnel compatibility).
+LECTURER_HOST_ONLY = _env_bool("LECTURER_HOST_ONLY", False)
 # Disable the subnet guard entirely (NOT recommended, debugging only).
 DISABLE_LAN_GUARD = _env_bool("DISABLE_LAN_GUARD", False)

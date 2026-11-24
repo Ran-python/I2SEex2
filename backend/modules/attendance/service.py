@@ -20,7 +20,19 @@ from sqlalchemy.orm import Session
 
 from core import config
 from core.database import iso_utc, utcnow
-from core.network import get_network_info
+from core.network import (
+    build_lecturer_network_lock,
+    compute_subnet,
+    detect_host_public_ip,
+    get_network_info,
+    is_private_or_loopback,
+    is_same_classroom_net,
+    lookup_ip_asn,
+    normalize_ip,
+    parse_network_profile,
+    resolve_app_base_url,
+    verify_classroom_network,
+)
 from modules.attendance.models import (
     LESSON_CLOSED,
     LESSON_OPEN,
@@ -105,11 +117,13 @@ def next_lesson_number(db: Session, course_id: int) -> int:
     return (max_num or 0) + 1
 
 
-def build_checkin_url(token: str, frontend_port: int | None) -> str:
-    lan_ip = get_network_info(force_refresh=True).lan_ip
-    port = frontend_port or config.DEFAULT_FRONTEND_PORT
-    port_part = "" if port == 80 else f":{port}"
-    return f"http://{lan_ip}{port_part}/attendance/checkin?token={token}"
+def build_checkin_url(
+    token: str,
+    frontend_port: int | None = None,
+    base_url: str | None = None,
+) -> str:
+    resolved = resolve_app_base_url(request=None, base_url=base_url, frontend_port=frontend_port)
+    return f"{resolved}/attendance/checkin?token={token}"
 
 
 def open_session(
@@ -117,6 +131,9 @@ def open_session(
     frontend_port: int | None,
     course_id: int | None = None,
     title: str | None = None,
+    base_url: str | None = None,
+    lecturer_ip: str | None = None,
+    allow_any_network: bool = False,
 ) -> Lesson:
     course = resolve_course(db, course_id)
     now = utcnow()
@@ -131,6 +148,9 @@ def open_session(
     num = next_lesson_number(db, course.id)
     lesson_title = clean_text(title) or f"Lesson {num}"
     token = secrets.token_urlsafe(18)
+    effective_ip, encoded_subnet = build_lecturer_network_lock(
+        lecturer_ip, allow_any_network=allow_any_network
+    )
 
     # Reset is_present to False ("לא נוכח") for all students in this course when a new lesson starts.
     db.execute(
@@ -143,7 +163,9 @@ def open_session(
         title=lesson_title,
         status=LESSON_OPEN,
         qr_token=token,
-        checkin_url=build_checkin_url(token, frontend_port),
+        checkin_url=build_checkin_url(token, frontend_port=frontend_port, base_url=base_url),
+        lecturer_ip=effective_ip,
+        lecturer_subnet=encoded_subnet,
         opened_at=now,
         expires_at=now + timedelta(seconds=config.SESSION_DURATION_SECONDS),
     )
@@ -153,7 +175,14 @@ def open_session(
     return lesson
 
 
-def reopen_lesson(db: Session, lesson_id: int, frontend_port: int | None) -> Lesson:
+def reopen_lesson(
+    db: Session,
+    lesson_id: int,
+    frontend_port: int | None,
+    base_url: str | None = None,
+    lecturer_ip: str | None = None,
+    allow_any_network: bool | None = None,
+) -> Lesson:
     """Re-open an existing lesson's QR session for another 15 minutes."""
     lesson = db.get(Lesson, lesson_id)
     if lesson is None:
@@ -165,13 +194,46 @@ def reopen_lesson(db: Session, lesson_id: int, frontend_port: int | None) -> Les
         active.status = LESSON_CLOSED
         active.closed_at = now
 
+    existing_profile = parse_network_profile(lesson.lecturer_ip, lesson.lecturer_subnet)
+    override_flag = (
+        allow_any_network
+        if allow_any_network is not None
+        else existing_profile["allow_any_network"]
+    )
+
     token = secrets.token_urlsafe(18)
+    raw_ip = lecturer_ip or lesson.lecturer_ip or "127.0.0.1"
+    effective_ip, encoded_subnet = build_lecturer_network_lock(
+        raw_ip, allow_any_network=override_flag
+    )
     lesson.status = LESSON_OPEN
     lesson.closed_at = None
     lesson.opened_at = now
     lesson.expires_at = now + timedelta(seconds=config.SESSION_DURATION_SECONDS)
     lesson.qr_token = token
-    lesson.checkin_url = build_checkin_url(token, frontend_port)
+    lesson.checkin_url = build_checkin_url(token, frontend_port=frontend_port, base_url=base_url)
+    lesson.lecturer_ip = effective_ip
+    lesson.lecturer_subnet = encoded_subnet
+    db.commit()
+    db.refresh(lesson)
+    return lesson
+
+
+def toggle_session_network_override(
+    db: Session,
+    lesson_id: int,
+    allow_any_network: bool,
+    lecturer_ip: str | None = None,
+) -> Lesson:
+    lesson = db.get(Lesson, lesson_id)
+    if lesson is None:
+        raise AttendanceError(404, "Lesson not found.")
+    raw_ip = lecturer_ip or lesson.lecturer_ip or "127.0.0.1"
+    effective_ip, encoded_subnet = build_lecturer_network_lock(
+        raw_ip, allow_any_network=allow_any_network
+    )
+    lesson.lecturer_ip = effective_ip
+    lesson.lecturer_subnet = encoded_subnet
     db.commit()
     db.refresh(lesson)
     return lesson
@@ -229,6 +291,112 @@ def close_session(db: Session, lesson_id: int | None = None) -> Lesson | None:
         db.commit()
         return lesson
     return None
+
+
+def list_lessons_for_course(db: Session, course_id: int | None = None) -> list[dict]:
+    _sync_expired_lessons(db)
+    course = resolve_course(db, course_id)
+    lessons = db.scalars(
+        select(Lesson)
+        .where(Lesson.course_id == course.id)
+        .order_by(Lesson.lesson_number.desc(), Lesson.id.desc())
+    ).all()
+    return [l.to_dict() for l in lessons]
+
+
+def update_photo_headcount(
+    db: Session,
+    lesson_id: int,
+    headcount: int | None,
+    analysis: str | None = None,
+) -> dict:
+    lesson = db.get(Lesson, lesson_id)
+    if lesson is None:
+        raise AttendanceError(404, "Lesson not found.")
+    lesson.photo_headcount = headcount
+    lesson.photo_analysis = clean_text(analysis) if analysis else None
+    lesson.photo_checked_at = utcnow() if headcount is not None else None
+    db.commit()
+    db.refresh(lesson)
+
+    registered = (
+        db.scalar(
+            select(func.count(AttendanceRecord.id)).where(AttendanceRecord.lesson_id == lesson.id)
+        )
+        or 0
+    )
+    discrepancy = (registered - headcount) if headcount is not None else 0
+    return {
+        "lesson": lesson.to_dict(present_count=registered),
+        "registered_count": registered,
+        "photo_headcount": headcount,
+        "photo_analysis": lesson.photo_analysis,
+        "discrepancy": discrepancy,
+        "discrepancy_alert": bool(headcount is not None and registered > headcount),
+    }
+
+
+def analyze_classroom_photo(
+    db: Session,
+    lesson_id: int,
+    image_bytes: bytes,
+    mime_type: str,
+    ai_cfg,
+) -> dict:
+    from core.ai import AIError, analyze_image, extract_json_object
+
+    lesson = db.get(Lesson, lesson_id)
+    if lesson is None:
+        raise AttendanceError(404, "Lesson not found.")
+    if not image_bytes:
+        raise AttendanceError(400, "The uploaded image file is empty.")
+
+    system_prompt = (
+        "You are an expert computer-vision classroom attendance auditor. "
+        "Carefully count every distinct student seated in the lecture hall/classroom photo. "
+        "Do not count empty chairs or laptops without a person. "
+        "Return ONLY a JSON object with keys: "
+        '{"headcount": <integer>, "row_breakdown": "<short summary by front/middle/back rows>", '
+        '"confidence": "high|medium|low", "notes": "<1-2 sentence summary>"}'
+    )
+    user_prompt = (
+        "Count all visible students seated in this classroom photo. "
+        "Respond strictly with valid JSON containing headcount (integer), row_breakdown, confidence, and notes."
+    )
+    try:
+        raw_reply, model_used = analyze_image(
+            ai_cfg,
+            image_bytes=image_bytes,
+            mime_type=mime_type,
+            prompt=user_prompt,
+            system_prompt=system_prompt,
+        )
+    except AIError as exc:
+        raise AttendanceError(exc.status_code, exc.message) from exc
+
+    parsed = extract_json_object(raw_reply)
+    count_val = parsed.get("headcount")
+    if count_val is None:
+        nums = re.findall(r"\b(\d{1,3})\b", raw_reply)
+        count_val = int(nums[0]) if nums else 0
+    else:
+        try:
+            count_val = max(0, int(count_val))
+        except Exception:
+            count_val = 0
+
+    breakdown = parsed.get("row_breakdown") or ""
+    confidence = parsed.get("confidence") or "high"
+    notes = parsed.get("notes") or raw_reply[:300]
+    summary = f"Counted {count_val} students ({confidence} confidence via {model_used})."
+    if breakdown:
+        summary += f" Rows: {breakdown}."
+    elif notes:
+        summary += f" {notes}"
+
+    res = update_photo_headcount(db, lesson_id=lesson.id, headcount=count_val, analysis=summary[:950])
+    res["model_used"] = model_used
+    return res
 
 
 def render_qr_png(data: str) -> bytes:
@@ -319,8 +487,18 @@ def check_in(
         if lesson is None or not secrets.compare_digest(lesson.qr_token, token):
             raise AttendanceError(410, "Attendance is currently closed or this QR code has expired.")
 
-        if not device.fingerprint:
-            raise AttendanceError(400, "Missing device fingerprint. Please reload the page and try again.")
+        net_ok, net_reason, net_diag = verify_classroom_network(
+            device.client_ip, lesson.lecturer_ip, lesson.lecturer_subnet
+        )
+        if not net_ok:
+            raise AttendanceError(
+                403,
+                net_reason,
+                network_diagnostic=net_diag,
+            )
+
+        effective_fp = device.fingerprint or (f"fp_id_{device.device_id}" if device.device_id else f"fp_ip_{device.client_ip}")
+        device.fingerprint = effective_fp
 
         remaining = device_lock_remaining(db, device)
         if remaining:
@@ -561,6 +739,7 @@ def build_dashboard(
     db: Session,
     course_id: int | None = None,
     lesson_id: int | None = None,
+    client_ip: str | None = None,
 ) -> dict:
     _sync_expired_lessons(db)
     courses = list_courses(db)
@@ -615,8 +794,28 @@ def build_dashboard(
 
     present = sum(1 for r in rows if r["status"])
     roster_size = sum(1 for r in rows if r["in_roster"])
-    info = get_network_info()
     next_num = next_lesson_number(db, selected_course.id)
+
+    ref_lesson = active_global or selected_lesson
+    detected_req_ip = normalize_ip(client_ip or get_network_info().lan_ip)
+    net_ip = (
+        ref_lesson.lecturer_ip
+        if (ref_lesson and ref_lesson.lecturer_ip)
+        else detected_req_ip
+    )
+    raw_subnet = (
+        ref_lesson.lecturer_subnet
+        if (ref_lesson and ref_lesson.lecturer_subnet)
+        else compute_subnet(net_ip)
+    )
+    profile = parse_network_profile(net_ip, raw_subnet)
+    public_ip = (
+        profile["public_ip"]
+        or (net_ip if not is_private_or_loopback(net_ip) else None)
+        or (detected_req_ip if not is_private_or_loopback(detected_req_ip) else None)
+        or detect_host_public_ip()
+    )
+    asn_info = lookup_ip_asn(public_ip) if public_ip else {"asn": profile["asn"] or "LOCAL", "org": "Local LAN"}
 
     return {
         "courses": courses,
@@ -642,7 +841,17 @@ def build_dashboard(
             "unlisted": sum(1 for r in rows if r["status"] == STATUS_UNLISTED),
             "manual": sum(1 for r in rows if r["status"] == STATUS_MANUAL),
         },
-        "network": {"lan_ip": info.lan_ip, "subnet": str(info.subnet)},
+        "network": {
+            "lecturer_ip": net_ip,
+            "detected_request_ip": detected_req_ip,
+            "lan_ip": get_network_info().lan_ip,
+            "public_ip": public_ip,
+            "subnet": profile["primary_subnet"],
+            "raw_subnet": raw_subnet,
+            "asn": profile["asn"] or asn_info.get("asn"),
+            "org": asn_info.get("org"),
+            "allow_any_network": profile["allow_any_network"],
+        },
         "server_time": iso_utc(utcnow()),
     }
 

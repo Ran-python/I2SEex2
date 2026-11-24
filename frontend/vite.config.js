@@ -9,9 +9,33 @@ const apiProxy = {
   '/api': {
     target: BACKEND,
     changeOrigin: false,
-    // Adds X-Forwarded-For with the student's real LAN IP so the backend
-    // subnet guard + device lock see the phone's address, not the proxy's.
-    xfwd: true,
+    // Do NOT set xfwd: true because Vite's http-proxy OVERWRITES Cloudflare's
+    // X-Forwarded-For header with 127.0.0.1! Instead, explicitly preserve
+    // CF-Connecting-IP and append/forward the original client IP cleanly.
+    xfwd: false,
+    configure: (proxy) => {
+      proxy.on('proxyReq', (proxyReq, req) => {
+        const cfIp = req.headers['cf-connecting-ip']
+        const origXff = req.headers['x-forwarded-for']
+        const remoteAddr = req.socket?.remoteAddress || '127.0.0.1'
+        if (cfIp) {
+          proxyReq.setHeader('cf-connecting-ip', cfIp)
+        }
+        if (origXff) {
+          proxyReq.setHeader('x-forwarded-for', `${origXff}, ${remoteAddr}`)
+        } else if (cfIp) {
+          proxyReq.setHeader('x-forwarded-for', `${cfIp}, ${remoteAddr}`)
+        } else {
+          proxyReq.setHeader('x-forwarded-for', remoteAddr)
+        }
+        if (req.headers['x-forwarded-proto']) {
+          proxyReq.setHeader('x-forwarded-proto', req.headers['x-forwarded-proto'])
+        }
+        if (req.headers['x-forwarded-host']) {
+          proxyReq.setHeader('x-forwarded-host', req.headers['x-forwarded-host'])
+        }
+      })
+    },
   },
 }
 
@@ -19,15 +43,17 @@ const apiProxy = {
 export default defineConfig({
   plugins: [react()],
   server: {
-    host: '0.0.0.0', // reachable over the LAN (http://192.168.x.x:5173)
+    host: '0.0.0.0',
     port: 5173,
     strictPort: true,
+    allowedHosts: true, // allow Cloudflare Tunnel (*.trycloudflare.com), ngrok, Render, etc.
     proxy: apiProxy,
   },
   preview: {
     host: '0.0.0.0',
     port: 4173,
     strictPort: true,
+    allowedHosts: true,
     proxy: apiProxy,
   },
 })

@@ -4,7 +4,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Iterator
 
-from sqlalchemy import create_engine, event, func, select
+from sqlalchemy import create_engine, event, func, select, text
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
 from core.config import DATABASE_PATH, DATABASE_URL, IS_POSTGRES
@@ -95,6 +95,23 @@ def _migrate_existing_sqlite_schema() -> None:
             cur.execute("CREATE INDEX IF NOT EXISTS ix_students_course_id ON students (course_id)")
         if student_cols and "is_present" not in student_cols:
             cur.execute("ALTER TABLE students ADD COLUMN is_present BOOLEAN NOT NULL DEFAULT 0")
+
+        lesson_cols = _table_columns(cur, "lessons")
+        if lesson_cols and "lecturer_ip" not in lesson_cols:
+            cur.execute("ALTER TABLE lessons ADD COLUMN lecturer_ip VARCHAR(64)")
+        if lesson_cols and "lecturer_subnet" not in lesson_cols:
+            cur.execute("ALTER TABLE lessons ADD COLUMN lecturer_subnet VARCHAR(64)")
+        if lesson_cols and "photo_headcount" not in lesson_cols:
+            cur.execute("ALTER TABLE lessons ADD COLUMN photo_headcount INTEGER")
+        if lesson_cols and "photo_analysis" not in lesson_cols:
+            cur.execute("ALTER TABLE lessons ADD COLUMN photo_analysis VARCHAR(1000)")
+        if lesson_cols and "photo_checked_at" not in lesson_cols:
+            cur.execute("ALTER TABLE lessons ADD COLUMN photo_checked_at DATETIME")
+
+        comment_cols = _table_columns(cur, "comments")
+        if comment_cols and "author_student_id" not in comment_cols:
+            cur.execute("ALTER TABLE comments ADD COLUMN author_student_id INTEGER REFERENCES students(id) ON DELETE SET NULL")
+            cur.execute("UPDATE comments SET author_student_id = student_id WHERE author_student_id IS NULL")
 
         if _table_exists(cur, "attendance_sessions"):
             cur.execute(
@@ -218,6 +235,15 @@ def _init_postgres_defaults() -> None:
     """Ensure initial data or SQLite migration has been applied on PostgreSQL startup."""
     from modules.roster.models import DEFAULT_COURSE_NAME, Course
 
+    with engine.begin() as conn:
+        conn.execute(text("ALTER TABLE lessons ADD COLUMN IF NOT EXISTS lecturer_ip VARCHAR(64)"))
+        conn.execute(text("ALTER TABLE lessons ADD COLUMN IF NOT EXISTS lecturer_subnet VARCHAR(64)"))
+        conn.execute(text("ALTER TABLE lessons ADD COLUMN IF NOT EXISTS photo_headcount INTEGER"))
+        conn.execute(text("ALTER TABLE lessons ADD COLUMN IF NOT EXISTS photo_analysis VARCHAR(1000)"))
+        conn.execute(text("ALTER TABLE lessons ADD COLUMN IF NOT EXISTS photo_checked_at TIMESTAMP"))
+        conn.execute(text("ALTER TABLE comments ADD COLUMN IF NOT EXISTS author_student_id INTEGER REFERENCES students(id) ON DELETE SET NULL"))
+        conn.execute(text("UPDATE comments SET author_student_id = student_id WHERE author_student_id IS NULL AND student_id IS NOT NULL"))
+
     with SessionLocal() as db:
         course_count = db.scalar(select(func.count(Course.id))) or 0
 
@@ -239,6 +265,10 @@ def init_db() -> None:
     # Import models so they register with Base.metadata before create_all.
     import modules.roster.models  # noqa: F401
     import modules.attendance.models  # noqa: F401
+    import modules.comments.models  # noqa: F401
+    import modules.polls.models  # noqa: F401
+    import modules.summary.models  # noqa: F401
+    import modules.homework.models  # noqa: F401
 
     Base.metadata.create_all(bind=engine)
     if engine.dialect.name == "sqlite":

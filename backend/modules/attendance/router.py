@@ -1,13 +1,24 @@
 """Attendance REST API (mounted under /api/attendance)."""
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, Query, Request, Response
+from fastapi import APIRouter, Depends, File, Query, Request, Response, UploadFile
 from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 
 from core import config
+from core.ai import AIError, extract_ai_config
 from core.database import get_db, iso_utc
-from core.network import get_client_ip, is_host_ip, require_lecturer_host
+from core.network import (
+    get_client_ip,
+    is_host_ip,
+    is_https_request,
+    is_same_classroom_net,
+    lookup_ip_asn,
+    parse_network_profile,
+    require_lecturer_host,
+    resolve_app_base_url,
+    verify_classroom_network,
+)
 from modules.attendance import service
 from modules.attendance.models import Lesson
 from modules.attendance.schemas import (
@@ -15,7 +26,9 @@ from modules.attendance.schemas import (
     CloseSessionRequest,
     LessonRenameRequest,
     ManualMarkRequest,
+    NetworkOverrideRequest,
     OpenSessionRequest,
+    PhotoHeadcountUpdate,
 )
 from modules.attendance.service import AttendanceError, DeviceIdentity
 
@@ -45,15 +58,34 @@ def _device(request: Request, fingerprint: str | None = None, device_id: str | N
 def attendance_status(request: Request, token: str | None = Query(default=None), db: Session = Depends(get_db)):
     """Public status for the student page: is attendance open, which class/lesson, is device locked?"""
     lesson = service.get_active_session(db)
-    host = is_host_ip(get_client_ip(request))
+    client_ip = get_client_ip(request)
+    if lesson:
+        net_ok, net_reason, net_diag = verify_classroom_network(
+            client_ip, lesson.lecturer_ip, lesson.lecturer_subnet
+        )
+    else:
+        asn_info = lookup_ip_asn(client_ip)
+        net_ok = bool(is_host_ip(client_ip))
+        net_reason = "No active attendance session"
+        net_diag = {
+            "student_ip": client_ip,
+            "student_asn": asn_info.get("asn"),
+            "student_org": asn_info.get("org"),
+        }
+    same_net = bool(is_host_ip(client_ip) or net_ok)
     return {
         "active": lesson is not None,
         "seconds_remaining": lesson.seconds_remaining() if lesson else 0,
         "token_valid": bool(lesson and token and token == lesson.qr_token),
-        # Only the lecturer's own machine (demo "Student View" toggle) receives the token;
-        # real students must get it from the QR code.
-        "token": lesson.qr_token if (lesson and host) else None,
+        # Demo "Student View" on the lecturer's network/browser receives the token;
+        # remote students must scan the QR code.
+        "token": lesson.qr_token if (lesson and same_net) else None,
         "device_lock_seconds": service.device_lock_remaining(db, _device(request)),
+        "network_diagnostic": {
+            **net_diag,
+            "same_classroom_network": same_net,
+            "verification_reason": net_reason,
+        },
         "course": (
             {"id": lesson.course.id, "name": lesson.course.name}
             if (lesson and lesson.course)
@@ -91,7 +123,7 @@ def check_in(payload: CheckInRequest, request: Request, response: Response, db: 
         max_age=config.DEVICE_LOCK_SECONDS,
         httponly=True,
         samesite="lax",
-        secure=False,  # plain HTTP on the LAN
+        secure=is_https_request(request),
         path="/",
     )
     lesson = result.lesson
@@ -122,18 +154,33 @@ def check_in(payload: CheckInRequest, request: Request, response: Response, db: 
 # ---------------------------------------------------------------- lecturer side
 @router.get("/dashboard", dependencies=lecturer)
 def dashboard(
+    request: Request = None,
     course_id: int | None = Query(default=None),
     lesson_id: int | None = Query(default=None),
     db: Session = Depends(get_db),
 ):
-    return service.build_dashboard(db, course_id=course_id, lesson_id=lesson_id)
+    client_ip = get_client_ip(request) if request is not None else None
+    return service.build_dashboard(db, course_id=course_id, lesson_id=lesson_id, client_ip=client_ip)
 
 
 @router.post("/sessions/open", dependencies=lecturer)
-def open_session(payload: OpenSessionRequest, db: Session = Depends(get_db)):
+def open_session(
+    payload: OpenSessionRequest,
+    request: Request = None,
+    db: Session = Depends(get_db),
+):
+    lecturer_ip = get_client_ip(request)
+    resolved_base = resolve_app_base_url(request, payload.base_url, payload.frontend_port)
     if payload.lesson_id is not None:
         try:
-            lesson = service.reopen_lesson(db, payload.lesson_id, payload.frontend_port)
+            lesson = service.reopen_lesson(
+                db,
+                payload.lesson_id,
+                payload.frontend_port,
+                base_url=resolved_base,
+                lecturer_ip=lecturer_ip,
+                allow_any_network=payload.allow_any_network,
+            )
         except AttendanceError as exc:
             return _error(exc)
         return lesson.to_dict()
@@ -142,23 +189,68 @@ def open_session(payload: OpenSessionRequest, db: Session = Depends(get_db)):
         frontend_port=payload.frontend_port,
         course_id=payload.course_id,
         title=payload.title,
+        base_url=resolved_base,
+        lecturer_ip=lecturer_ip,
+        allow_any_network=payload.allow_any_network,
     )
     return lesson.to_dict()
 
 
+@router.patch("/lessons/{lesson_id}/network-override", dependencies=lecturer)
+def set_network_override(
+    lesson_id: int,
+    payload: NetworkOverrideRequest,
+    request: Request = None,
+    db: Session = Depends(get_db),
+):
+    try:
+        lesson = service.toggle_session_network_override(
+            db,
+            lesson_id=lesson_id,
+            allow_any_network=payload.allow_any_network,
+            lecturer_ip=get_client_ip(request),
+        )
+        profile = parse_network_profile(lesson.lecturer_ip, lesson.lecturer_subnet)
+        return {
+            "ok": True,
+            "lesson": lesson.to_dict(),
+            "allow_any_network": profile["allow_any_network"],
+        }
+    except AttendanceError as exc:
+        return _error(exc)
+
+
 @router.post("/lessons/{lesson_id}/reopen", dependencies=lecturer)
 @router.put("/lessons/{lesson_id}/reopen", dependencies=lecturer)
-def reopen_lesson(lesson_id: int, payload: OpenSessionRequest | None = None, db: Session = Depends(get_db)):
+def reopen_lesson(
+    lesson_id: int,
+    payload: OpenSessionRequest | None = None,
+    request: Request = None,
+    db: Session = Depends(get_db),
+):
     port = payload.frontend_port if payload else None
+    base_url = resolve_app_base_url(request, payload.base_url if payload else None, port)
+    lecturer_ip = get_client_ip(request)
     try:
-        lesson = service.reopen_lesson(db, lesson_id, port)
+        lesson = service.reopen_lesson(
+            db,
+            lesson_id,
+            port,
+            base_url=base_url,
+            lecturer_ip=lecturer_ip,
+        )
     except AttendanceError as exc:
         return _error(exc)
     return lesson.to_dict()
 
 
 @router.patch("/lessons/{lesson_id}", dependencies=lecturer)
-def rename_lesson(lesson_id: int, payload: LessonRenameRequest, db: Session = Depends(get_db)):
+def rename_lesson(
+    lesson_id: int,
+    payload: LessonRenameRequest,
+    request: Request = None,
+    db: Session = Depends(get_db),
+):
     try:
         raw_title = (payload.title or "").strip()
         if raw_title == "__DELETE_LESSON__":
@@ -166,7 +258,14 @@ def rename_lesson(lesson_id: int, payload: LessonRenameRequest, db: Session = De
             return {"ok": True, "deleted": True}
         if payload.reopen or raw_title.startswith("__REOPEN__:"):
             clean_title = raw_title[len("__REOPEN__:"):].strip() if raw_title.startswith("__REOPEN__:") else raw_title
-            lesson = service.reopen_lesson(db, lesson_id, payload.frontend_port)
+            base_url = resolve_app_base_url(request, payload.base_url, payload.frontend_port)
+            lesson = service.reopen_lesson(
+                db,
+                lesson_id,
+                payload.frontend_port,
+                base_url=base_url,
+                lecturer_ip=get_client_ip(request),
+            )
             if clean_title:
                 lesson = service.rename_lesson(db, lesson_id, clean_title)
         else:
@@ -174,6 +273,58 @@ def rename_lesson(lesson_id: int, payload: LessonRenameRequest, db: Session = De
     except AttendanceError as exc:
         return _error(exc)
     return lesson.to_dict()
+
+
+@router.get("/lessons")
+def list_course_lessons(
+    course_id: int | None = Query(default=None),
+    db: Session = Depends(get_db),
+):
+    """Public list of lessons for a course (used by Student View comments/polls context)."""
+    return service.list_lessons_for_course(db, course_id=course_id)
+
+
+@router.post("/lessons/{lesson_id}/photo-headcount", dependencies=lecturer)
+async def upload_photo_headcount(
+    lesson_id: int,
+    request: Request,
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+):
+    content = await file.read()
+    mime_type = (file.content_type or "image/jpeg").lower()
+    if not mime_type.startswith("image/"):
+        mime_type = "image/jpeg"
+    try:
+        ai_cfg = extract_ai_config(request)
+        return service.analyze_classroom_photo(
+            db,
+            lesson_id=lesson_id,
+            image_bytes=content,
+            mime_type=mime_type,
+            ai_cfg=ai_cfg,
+        )
+    except AIError as exc:
+        return JSONResponse(status_code=exc.status_code, content={"detail": exc.message})
+    except AttendanceError as exc:
+        return _error(exc)
+
+
+@router.patch("/lessons/{lesson_id}/photo-headcount", dependencies=lecturer)
+def set_photo_headcount_manual(
+    lesson_id: int,
+    payload: PhotoHeadcountUpdate,
+    db: Session = Depends(get_db),
+):
+    try:
+        return service.update_photo_headcount(
+            db,
+            lesson_id=lesson_id,
+            headcount=payload.photo_headcount,
+            analysis=payload.photo_analysis,
+        )
+    except AttendanceError as exc:
+        return _error(exc)
 
 
 @router.delete("/lessons/{lesson_id}", dependencies=lecturer)

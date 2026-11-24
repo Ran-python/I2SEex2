@@ -8,9 +8,14 @@ class OpenSessionRequest(BaseModel):
     course_id: int | None = None
     lesson_id: int | None = None
     title: str | None = Field(default=None, max_length=200)
-    # Port the browser used to load the frontend (5173 for Vite dev, 8000 when the backend
-    # serves the built frontend). The host part of the QR URL is always the detected LAN IP.
+    # Origin URL from window.location.origin (e.g. https://my-app.onrender.com or tunnel URL)
+    base_url: str | None = Field(default=None, max_length=500)
     frontend_port: int | None = Field(default=None, ge=1, le=65535)
+    allow_any_network: bool = False
+
+
+class NetworkOverrideRequest(BaseModel):
+    allow_any_network: bool = False
 
 
 class CloseSessionRequest(BaseModel):
@@ -20,6 +25,7 @@ class CloseSessionRequest(BaseModel):
 class LessonRenameRequest(BaseModel):
     title: str | None = Field(default=None, max_length=200)
     reopen: bool = False
+    base_url: str | None = Field(default=None, max_length=500)
     frontend_port: int | None = Field(default=None, ge=1, le=65535)
 
 
@@ -35,3 +41,8 @@ class CheckInRequest(BaseModel):
 class ManualMarkRequest(BaseModel):
     student_id: int
     lesson_id: int | None = None
+
+
+class PhotoHeadcountUpdate(BaseModel):
+    photo_headcount: int | None = Field(default=None, ge=0, le=2000)
+    photo_analysis: str | None = Field(default=None, max_length=1000)
