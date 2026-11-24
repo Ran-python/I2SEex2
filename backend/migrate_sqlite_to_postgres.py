@@ -238,16 +238,16 @@ def migrate_sqlite_to_postgres(
                 cols = {r[1] for r in s_cur.execute("PRAGMA table_info(device_locks)").fetchall()}
                 fk_col = "lesson_id" if "lesson_id" in cols else "session_id"
                 for row in s_cur.execute(
-                    f"SELECT id, cookie_token, fingerprint, device_id, client_ip, {fk_col} AS lesson_id, student_id, created_at, expires_at "
+                    f"SELECT id, cookie_token, fingerprint, device_id, {fk_col} AS lesson_id, student_id, created_at, expires_at "
                     "FROM device_locks ORDER BY id"
                 ):
                     pg_conn.execute(
                         text(
                             """
                             INSERT INTO device_locks
-                                (id, cookie_token, fingerprint, device_id, client_ip, lesson_id, student_id, created_at, expires_at)
+                                (id, cookie_token, fingerprint, device_id, lesson_id, student_id, created_at, expires_at)
                             VALUES
-                                (:id, :cookie_token, :fingerprint, :device_id, :client_ip, :lesson_id, :student_id, :created_at, :expires_at)
+                                (:id, :cookie_token, :fingerprint, :device_id, :lesson_id, :student_id, :created_at, :expires_at)
                             ON CONFLICT (id) DO NOTHING
                             """
                         ),
@@ -256,7 +256,6 @@ def migrate_sqlite_to_postgres(
                             "cookie_token": str(row["cookie_token"]),
                             "fingerprint": str(row["fingerprint"]),
                             "device_id": row["device_id"],
-                            "client_ip": row["client_ip"],
                             "lesson_id": int(row["lesson_id"]) if row["lesson_id"] is not None else None,
                             "student_id": int(row["student_id"]) if row["student_id"] is not None else None,
                             "created_at": _parse_dt(row["created_at"]) or utcnow(),

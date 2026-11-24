@@ -14,12 +14,18 @@ function formatLessonLabel(lesson) {
   return `${base}: ${lesson.title}`
 }
 
-function ClassLessonBadge({ course, lesson }) {
+function ClassLessonBadge({ course, lesson, radiusMeters }) {
   if (!course && !lesson) return null
+  const radius = radiusMeters ?? lesson?.radius_meters
   return (
     <div className="student-context-box" dir="auto">
       {course?.name && <div className="student-context-box__course">📚 {course.name}</div>}
       {lesson && <div className="student-context-box__lesson">{formatLessonLabel(lesson)}</div>}
+      {radius !== null && radius !== undefined && (
+        <div className="muted" style={{ fontSize: '0.84rem', marginTop: '0.2rem' }}>
+          📍 Allowed Classroom GPS Radius: <strong>{Math.round(radius)}m</strong>
+        </div>
+      )}
     </div>
   )
 }
@@ -45,45 +51,48 @@ function LockNotice({ seconds, syncKey }) {
   )
 }
 
-function StudentNetworkDiagnostic({ diag }) {
-  if (!diag) return null
-  const asnLabel = diag.student_asn
-    ? `${diag.student_asn}${diag.student_org ? ` (${diag.student_org})` : ''}`
-    : 'Detecting…'
-  return (
-    <div
-      className="qr-url-box"
-      style={{ marginTop: '1rem', textAlign: 'left', fontSize: '0.84rem' }}
-      aria-label="Student Network Diagnostic Box"
-    >
-      <span className="qr-url-box__label">📡 Your Network Diagnostic</span>
-      <div style={{ display: 'grid', gap: '0.2rem', marginTop: '0.2rem' }}>
-        <div>
-          <strong>Your Detected IP:</strong> <code>{diag.student_ip || 'Unknown'}</code>
-        </div>
-        <div>
-          <strong>Your ISP / ASN:</strong> <code>{asnLabel}</code>
-        </div>
-        {diag.lecturer_subnet && (
-          <div>
-            <strong>Classroom Network:</strong>{' '}
-            <code>
-              {diag.lecturer_subnet}
-              {diag.lecturer_asn ? ` · ${diag.lecturer_asn}` : ''}
-            </code>
-          </div>
-        )}
-        {diag.verification_reason && (
-          <div>
-            <strong>Network Verification:</strong>{' '}
-            <span className={diag.same_classroom_network ? 'badge badge--success' : 'badge badge--warning'}>
-              {diag.verification_reason}
-            </span>
-          </div>
-        )}
-      </div>
-    </div>
-  )
+function acquireStudentGps() {
+  return new Promise((resolve, reject) => {
+    if (!navigator.geolocation) {
+      reject(
+        new Error(
+          'Geolocation is not supported by your browser. Please enable location services or use a modern mobile browser.',
+        ),
+      )
+      return
+    }
+    navigator.geolocation.getCurrentPosition(
+      (pos) => {
+        resolve({
+          latitude: Number(pos.coords.latitude.toFixed(6)),
+          longitude: Number(pos.coords.longitude.toFixed(6)),
+          accuracy: Math.round(pos.coords.accuracy || 0),
+        })
+      },
+      (err) => {
+        if (err.code === 1) {
+          reject(
+            new Error(
+              'Location access was denied. Please enable Location Services for your browser to verify that you are in the classroom.',
+            ),
+          )
+        } else if (err.code === 3) {
+          reject(
+            new Error(
+              'GPS location request timed out (10s). Please ensure GPS/Location Services are enabled on your device and try again.',
+            ),
+          )
+        } else {
+          reject(
+            new Error(
+              `Unable to retrieve your GPS coordinates (${err.message || 'Location unavailable'}). Please enable Location Services and try again.`,
+            ),
+          )
+        }
+      },
+      { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 },
+    )
+  })
 }
 
 export default function StudentCheckIn({ urlToken }) {
@@ -94,8 +103,8 @@ export default function StudentCheckIn({ urlToken }) {
     email: '',
   })
   const [submitting, setSubmitting] = useState(false)
+  const [locatingGps, setLocatingGps] = useState(false)
   const [error, setError] = useState(null)
-  const [errorDiag, setErrorDiag] = useState(null)
   const [lock, setLock] = useState(null) // { seconds, at }
   const [success, setSuccess] = useState(null)
 
@@ -118,7 +127,6 @@ export default function StudentCheckIn({ urlToken }) {
   const token = effectiveUrlToken || status?.token || null
   const tokenUsable = Boolean(status?.active && token && (effectiveUrlToken ? status.token_valid : true))
   const lockSeconds = lock?.seconds ?? status?.device_lock_seconds ?? 0
-  const activeDiag = errorDiag || status?.network_diagnostic || null
 
   const update = (field) => (event) => setForm((f) => ({ ...f, [field]: event.target.value }))
 
@@ -129,34 +137,33 @@ export default function StudentCheckIn({ urlToken }) {
       return
     }
     setSubmitting(true)
+    setLocatingGps(true)
     setError(null)
-    setErrorDiag(null)
     const { fingerprint, deviceId } = getDeviceIdentity()
     try {
+      const coords = await acquireStudentGps()
+      setLocatingGps(false)
       const result = await api.post('/api/attendance/checkin', {
         token,
         full_name: form.full_name.trim(),
         id_number: form.id_number.trim() || null,
         email: form.email.trim() || null,
+        latitude: coords.latitude,
+        longitude: coords.longitude,
         fingerprint,
         device_id: deviceId,
       })
       setSuccess(result)
     } catch (err) {
+      setLocatingGps(false)
       if (err.status === 429) {
         setLock({ seconds: err.data?.retry_after_seconds ?? 0, at: Date.now() })
       } else if (err.status === 410) {
         refresh()
       }
-      if (err.data?.network_diagnostic) {
-        setErrorDiag({
-          ...err.data.network_diagnostic,
-          same_classroom_network: false,
-          verification_reason: err.message,
-        })
-      }
       setError(err.message)
     } finally {
+      setLocatingGps(false)
       setSubmitting(false)
     }
   }
@@ -169,7 +176,12 @@ export default function StudentCheckIn({ urlToken }) {
         <StatusCard icon="✅" title="You're checked in!" tone="success">
           <ClassLessonBadge course={success.course} lesson={success.lesson} />
           <p className="student-card__name">{success.student.full_name}</p>
-          <p className="muted">Registered at {time}</p>
+          <p className="muted">
+            Registered at {time}
+            {success.distance_meters !== null && success.distance_meters !== undefined
+              ? ` · 📍 Verified distance: ${Math.round(success.distance_meters)}m`
+              : ''}
+          </p>
           {success.unlisted && (
             <p className="notice notice--warning">
               Your name wasn't found in the course roster, so the lecturer was notified to verify it.
@@ -192,9 +204,9 @@ export default function StudentCheckIn({ urlToken }) {
   if (statusError && !status) {
     return (
       <div className="student-page">
-        <StatusCard icon="📡" title="Can't reach the class server" tone="danger">
+        <StatusCard icon="📡" title="Can't reach the server" tone="danger">
           <p>{statusError.message}</p>
-          <p className="muted">Make sure you're connected to the same Wi-Fi network as the lecturer.</p>
+          <p className="muted">Please check your internet connection and try again.</p>
         </StatusCard>
       </div>
     )
@@ -214,7 +226,7 @@ export default function StudentCheckIn({ urlToken }) {
     return (
       <div className="student-page">
         <StatusCard icon="🔒" title="Already registered from this device" tone="warning">
-          <ClassLessonBadge course={status.course} lesson={status.lesson} />
+          <ClassLessonBadge course={status.course} lesson={status.lesson} radiusMeters={status.radius_meters} />
           <p>Each device can register only once every 15 minutes.</p>
           <LockNotice seconds={lockSeconds} syncKey={lock?.at ?? 'status'} />
         </StatusCard>
@@ -226,13 +238,12 @@ export default function StudentCheckIn({ urlToken }) {
     return (
       <div className="student-page">
         <StatusCard icon="📷" title={effectiveUrlToken ? 'This QR code has expired' : 'Scan the QR code to check in'}>
-          <ClassLessonBadge course={status.course} lesson={status.lesson} />
+          <ClassLessonBadge course={status.course} lesson={status.lesson} radiusMeters={status.radius_meters} />
           <p className="muted">
             {effectiveUrlToken
               ? 'Please scan the QR code currently shown on the lecturer’s screen.'
               : 'Use your phone camera to scan the QR code shown on the lecturer’s screen.'}
           </p>
-          <StudentNetworkDiagnostic diag={activeDiag} />
         </StatusCard>
       </div>
     )
@@ -243,7 +254,7 @@ export default function StudentCheckIn({ urlToken }) {
       <form className="student-card checkin-form" onSubmit={submit} noValidate>
         <div className="student-card__icon" aria-hidden="true">🎓</div>
         <h1>Class Check-in</h1>
-        <ClassLessonBadge course={status.course} lesson={status.lesson} />
+        <ClassLessonBadge course={status.course} lesson={status.lesson} radiusMeters={status.radius_meters} />
         <p className="muted checkin-form__timer">
           Attendance closes in <strong>{formatClock(status.seconds_remaining)}</strong>
         </p>
@@ -292,18 +303,26 @@ export default function StudentCheckIn({ urlToken }) {
           />
         </label>
 
+        {locatingGps && (
+          <div className="notice notice--info" role="status">
+            📍 Acquiring your GPS coordinates to verify classroom proximity…
+          </div>
+        )}
+
         {error && (
           <div className="notice notice--danger" role="alert">
-            <strong>Check-in Rejection Reason:</strong> {error}
+            {error}
             {lock && <LockNotice seconds={lock.seconds} syncKey={lock.at} />}
           </div>
         )}
 
         <button type="submit" className="btn btn--primary btn--block btn--lg" disabled={submitting || !!lock}>
-          {submitting ? 'Submitting…' : 'Check in'}
+          {submitting
+            ? locatingGps
+              ? '📍 Verifying GPS Location…'
+              : 'Submitting…'
+            : '📍 Check in with GPS'}
         </button>
-
-        <StudentNetworkDiagnostic diag={activeDiag} />
       </form>
     </div>
   )

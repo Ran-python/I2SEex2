@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, UniqueConstraint
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, String, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from core.database import Base, iso_utc, utcnow
@@ -33,8 +33,9 @@ class Lesson(Base):
     closed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     qr_token: Mapped[str] = mapped_column(String(64), unique=True, nullable=False, index=True)
     checkin_url: Mapped[str] = mapped_column(String(500), nullable=False)
-    lecturer_ip: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    lecturer_subnet: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    latitude: Mapped[float | None] = mapped_column(Float, nullable=True)
+    longitude: Mapped[float | None] = mapped_column(Float, nullable=True)
+    radius_meters: Mapped[float] = mapped_column(Float, nullable=False, default=50.0)
     photo_headcount: Mapped[int | None] = mapped_column(Integer, nullable=True)
     photo_analysis: Mapped[str | None] = mapped_column(String(1000), nullable=True)
     photo_checked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
@@ -70,8 +71,9 @@ class Lesson(Base):
             "qr_token": self.qr_token,
             "token": self.qr_token,
             "checkin_url": self.checkin_url,
-            "lecturer_ip": self.lecturer_ip,
-            "lecturer_subnet": self.lecturer_subnet,
+            "latitude": self.latitude,
+            "longitude": self.longitude,
+            "radius_meters": self.radius_meters if self.radius_meters is not None else 50.0,
             "photo_headcount": self.photo_headcount,
             "photo_analysis": self.photo_analysis,
             "photo_checked_at": iso_utc(self.photo_checked_at),
@@ -100,6 +102,9 @@ class AttendanceRecord(Base):
     timestamp: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=utcnow)
     status: Mapped[str] = mapped_column(String(16), nullable=False)
     device_fingerprint: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    student_latitude: Mapped[float | None] = mapped_column(Float, nullable=True)
+    student_longitude: Mapped[float | None] = mapped_column(Float, nullable=True)
+    distance_meters: Mapped[float | None] = mapped_column(Float, nullable=True)
 
     student: Mapped[Student] = relationship(lazy="joined")
 
@@ -112,7 +117,6 @@ class DeviceLock(Base):
     cookie_token: Mapped[str] = mapped_column(String(64), unique=True, nullable=False, index=True)
     fingerprint: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
     device_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
-    client_ip: Mapped[str | None] = mapped_column(String(64), nullable=True)
     lesson_id: Mapped[int | None] = mapped_column(ForeignKey("lessons.id", ondelete="SET NULL"))
     student_id: Mapped[int | None] = mapped_column(ForeignKey("students.id", ondelete="SET NULL"))
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=utcnow)

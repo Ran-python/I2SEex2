@@ -97,16 +97,26 @@ def _migrate_existing_sqlite_schema() -> None:
             cur.execute("ALTER TABLE students ADD COLUMN is_present BOOLEAN NOT NULL DEFAULT 0")
 
         lesson_cols = _table_columns(cur, "lessons")
-        if lesson_cols and "lecturer_ip" not in lesson_cols:
-            cur.execute("ALTER TABLE lessons ADD COLUMN lecturer_ip VARCHAR(64)")
-        if lesson_cols and "lecturer_subnet" not in lesson_cols:
-            cur.execute("ALTER TABLE lessons ADD COLUMN lecturer_subnet VARCHAR(64)")
+        if lesson_cols and "latitude" not in lesson_cols:
+            cur.execute("ALTER TABLE lessons ADD COLUMN latitude REAL")
+        if lesson_cols and "longitude" not in lesson_cols:
+            cur.execute("ALTER TABLE lessons ADD COLUMN longitude REAL")
+        if lesson_cols and "radius_meters" not in lesson_cols:
+            cur.execute("ALTER TABLE lessons ADD COLUMN radius_meters REAL NOT NULL DEFAULT 50.0")
         if lesson_cols and "photo_headcount" not in lesson_cols:
             cur.execute("ALTER TABLE lessons ADD COLUMN photo_headcount INTEGER")
         if lesson_cols and "photo_analysis" not in lesson_cols:
             cur.execute("ALTER TABLE lessons ADD COLUMN photo_analysis VARCHAR(1000)")
         if lesson_cols and "photo_checked_at" not in lesson_cols:
             cur.execute("ALTER TABLE lessons ADD COLUMN photo_checked_at DATETIME")
+
+        rec_existing_cols = _table_columns(cur, "attendance_records")
+        if rec_existing_cols and "student_latitude" not in rec_existing_cols:
+            cur.execute("ALTER TABLE attendance_records ADD COLUMN student_latitude REAL")
+        if rec_existing_cols and "student_longitude" not in rec_existing_cols:
+            cur.execute("ALTER TABLE attendance_records ADD COLUMN student_longitude REAL")
+        if rec_existing_cols and "distance_meters" not in rec_existing_cols:
+            cur.execute("ALTER TABLE attendance_records ADD COLUMN distance_meters REAL")
 
         comment_cols = _table_columns(cur, "comments")
         if comment_cols and "author_student_id" not in comment_cols:
@@ -196,8 +206,8 @@ def _migrate_existing_sqlite_schema() -> None:
         if renamed_locks and _table_exists(cur, "_old_device_locks"):
             cur.execute(
                 "INSERT OR IGNORE INTO device_locks "
-                "(id, cookie_token, fingerprint, device_id, client_ip, lesson_id, student_id, created_at, expires_at) "
-                "SELECT id, cookie_token, fingerprint, device_id, client_ip, session_id, student_id, created_at, expires_at "
+                "(id, cookie_token, fingerprint, device_id, lesson_id, student_id, created_at, expires_at) "
+                "SELECT id, cookie_token, fingerprint, device_id, session_id, student_id, created_at, expires_at "
                 "FROM _old_device_locks"
             )
             cur.execute("DROP TABLE _old_device_locks")
@@ -236,11 +246,15 @@ def _init_postgres_defaults() -> None:
     from modules.roster.models import DEFAULT_COURSE_NAME, Course
 
     with engine.begin() as conn:
-        conn.execute(text("ALTER TABLE lessons ADD COLUMN IF NOT EXISTS lecturer_ip VARCHAR(64)"))
-        conn.execute(text("ALTER TABLE lessons ADD COLUMN IF NOT EXISTS lecturer_subnet VARCHAR(64)"))
+        conn.execute(text("ALTER TABLE lessons ADD COLUMN IF NOT EXISTS latitude DOUBLE PRECISION"))
+        conn.execute(text("ALTER TABLE lessons ADD COLUMN IF NOT EXISTS longitude DOUBLE PRECISION"))
+        conn.execute(text("ALTER TABLE lessons ADD COLUMN IF NOT EXISTS radius_meters DOUBLE PRECISION NOT NULL DEFAULT 50.0"))
         conn.execute(text("ALTER TABLE lessons ADD COLUMN IF NOT EXISTS photo_headcount INTEGER"))
         conn.execute(text("ALTER TABLE lessons ADD COLUMN IF NOT EXISTS photo_analysis VARCHAR(1000)"))
         conn.execute(text("ALTER TABLE lessons ADD COLUMN IF NOT EXISTS photo_checked_at TIMESTAMP"))
+        conn.execute(text("ALTER TABLE attendance_records ADD COLUMN IF NOT EXISTS student_latitude DOUBLE PRECISION"))
+        conn.execute(text("ALTER TABLE attendance_records ADD COLUMN IF NOT EXISTS student_longitude DOUBLE PRECISION"))
+        conn.execute(text("ALTER TABLE attendance_records ADD COLUMN IF NOT EXISTS distance_meters DOUBLE PRECISION"))
         conn.execute(text("ALTER TABLE comments ADD COLUMN IF NOT EXISTS author_student_id INTEGER REFERENCES students(id) ON DELETE SET NULL"))
         conn.execute(text("UPDATE comments SET author_student_id = student_id WHERE author_student_id IS NULL AND student_id IS NOT NULL"))
 

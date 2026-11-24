@@ -9,15 +9,9 @@ from core import config
 from core.ai import AIError, extract_ai_config
 from core.database import get_db, iso_utc
 from core.network import (
-    get_client_ip,
-    is_host_ip,
     is_https_request,
-    is_same_classroom_net,
-    lookup_ip_asn,
-    parse_network_profile,
     require_lecturer_host,
     resolve_app_base_url,
-    verify_classroom_network,
 )
 from modules.attendance import service
 from modules.attendance.models import Lesson
@@ -26,7 +20,6 @@ from modules.attendance.schemas import (
     CloseSessionRequest,
     LessonRenameRequest,
     ManualMarkRequest,
-    NetworkOverrideRequest,
     OpenSessionRequest,
     PhotoHeadcountUpdate,
 )
@@ -40,8 +33,11 @@ def _error(exc: AttendanceError) -> JSONResponse:
     headers = {}
     if "retry_after_seconds" in exc.extra:
         headers["Retry-After"] = str(exc.extra["retry_after_seconds"])
-    return JSONResponse(status_code=exc.status_code, content={"detail": exc.message, **exc.extra},
-                        headers=headers)
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"detail": exc.message, **exc.extra},
+        headers=headers,
+    )
 
 
 def _device(request: Request, fingerprint: str | None = None, device_id: str | None = None) -> DeviceIdentity:
@@ -49,7 +45,6 @@ def _device(request: Request, fingerprint: str | None = None, device_id: str | N
         cookie_token=request.cookies.get(config.DEVICE_LOCK_COOKIE),
         fingerprint=fingerprint or request.headers.get("x-device-fingerprint"),
         device_id=device_id or request.headers.get("x-device-id"),
-        client_ip=get_client_ip(request),
     )
 
 
@@ -58,34 +53,16 @@ def _device(request: Request, fingerprint: str | None = None, device_id: str | N
 def attendance_status(request: Request, token: str | None = Query(default=None), db: Session = Depends(get_db)):
     """Public status for the student page: is attendance open, which class/lesson, is device locked?"""
     lesson = service.get_active_session(db)
-    client_ip = get_client_ip(request)
-    if lesson:
-        net_ok, net_reason, net_diag = verify_classroom_network(
-            client_ip, lesson.lecturer_ip, lesson.lecturer_subnet
-        )
-    else:
-        asn_info = lookup_ip_asn(client_ip)
-        net_ok = bool(is_host_ip(client_ip))
-        net_reason = "No active attendance session"
-        net_diag = {
-            "student_ip": client_ip,
-            "student_asn": asn_info.get("asn"),
-            "student_org": asn_info.get("org"),
-        }
-    same_net = bool(is_host_ip(client_ip) or net_ok)
+    is_lecturer_preview = (request.headers.get("x-lecturer-pin") or "").strip() == config.LECTURER_PIN
     return {
         "active": lesson is not None,
         "seconds_remaining": lesson.seconds_remaining() if lesson else 0,
         "token_valid": bool(lesson and token and token == lesson.qr_token),
-        # Demo "Student View" on the lecturer's network/browser receives the token;
-        # remote students must scan the QR code.
-        "token": lesson.qr_token if (lesson and same_net) else None,
+        # Demo "Student View" on the lecturer's unlocked session receives the token;
+        # students on their phones scan the QR code containing ?token=...
+        "token": lesson.qr_token if (lesson and (is_lecturer_preview or (token and token == lesson.qr_token))) else None,
         "device_lock_seconds": service.device_lock_remaining(db, _device(request)),
-        "network_diagnostic": {
-            **net_diag,
-            "same_classroom_network": same_net,
-            "verification_reason": net_reason,
-        },
+        "radius_meters": lesson.radius_meters if lesson else None,
         "course": (
             {"id": lesson.course.id, "name": lesson.course.name}
             if (lesson and lesson.course)
@@ -96,6 +73,7 @@ def attendance_status(request: Request, token: str | None = Query(default=None),
                 "id": lesson.id,
                 "lesson_number": lesson.lesson_number,
                 "title": lesson.title,
+                "radius_meters": lesson.radius_meters,
             }
             if lesson
             else None
@@ -112,6 +90,8 @@ def check_in(payload: CheckInRequest, request: Request, response: Response, db: 
             full_name=payload.full_name,
             id_number=payload.id_number,
             email=payload.email,
+            latitude=payload.latitude,
+            longitude=payload.longitude,
             device=_device(request, payload.fingerprint, payload.device_id),
         )
     except AttendanceError as exc:
@@ -141,7 +121,9 @@ def check_in(payload: CheckInRequest, request: Request, response: Response, db: 
             "id": lesson.id,
             "lesson_number": lesson.lesson_number,
             "title": lesson.title,
+            "radius_meters": lesson.radius_meters,
         },
+        "distance_meters": result.record.distance_meters,
         "checked_in_at": iso_utc(result.record.timestamp),
         "device_lock_seconds": config.DEVICE_LOCK_SECONDS,
         "message": (
@@ -154,13 +136,11 @@ def check_in(payload: CheckInRequest, request: Request, response: Response, db: 
 # ---------------------------------------------------------------- lecturer side
 @router.get("/dashboard", dependencies=lecturer)
 def dashboard(
-    request: Request = None,
     course_id: int | None = Query(default=None),
     lesson_id: int | None = Query(default=None),
     db: Session = Depends(get_db),
 ):
-    client_ip = get_client_ip(request) if request is not None else None
-    return service.build_dashboard(db, course_id=course_id, lesson_id=lesson_id, client_ip=client_ip)
+    return service.build_dashboard(db, course_id=course_id, lesson_id=lesson_id)
 
 
 @router.post("/sessions/open", dependencies=lecturer)
@@ -169,7 +149,6 @@ def open_session(
     request: Request = None,
     db: Session = Depends(get_db),
 ):
-    lecturer_ip = get_client_ip(request)
     resolved_base = resolve_app_base_url(request, payload.base_url, payload.frontend_port)
     if payload.lesson_id is not None:
         try:
@@ -178,8 +157,9 @@ def open_session(
                 payload.lesson_id,
                 payload.frontend_port,
                 base_url=resolved_base,
-                lecturer_ip=lecturer_ip,
-                allow_any_network=payload.allow_any_network,
+                latitude=payload.latitude,
+                longitude=payload.longitude,
+                radius_meters=payload.radius_meters,
             )
         except AttendanceError as exc:
             return _error(exc)
@@ -190,54 +170,32 @@ def open_session(
         course_id=payload.course_id,
         title=payload.title,
         base_url=resolved_base,
-        lecturer_ip=lecturer_ip,
-        allow_any_network=payload.allow_any_network,
+        latitude=payload.latitude,
+        longitude=payload.longitude,
+        radius_meters=payload.radius_meters,
     )
     return lesson.to_dict()
-
-
-@router.patch("/lessons/{lesson_id}/network-override", dependencies=lecturer)
-def set_network_override(
-    lesson_id: int,
-    payload: NetworkOverrideRequest,
-    request: Request = None,
-    db: Session = Depends(get_db),
-):
-    try:
-        lesson = service.toggle_session_network_override(
-            db,
-            lesson_id=lesson_id,
-            allow_any_network=payload.allow_any_network,
-            lecturer_ip=get_client_ip(request),
-        )
-        profile = parse_network_profile(lesson.lecturer_ip, lesson.lecturer_subnet)
-        return {
-            "ok": True,
-            "lesson": lesson.to_dict(),
-            "allow_any_network": profile["allow_any_network"],
-        }
-    except AttendanceError as exc:
-        return _error(exc)
 
 
 @router.post("/lessons/{lesson_id}/reopen", dependencies=lecturer)
 @router.put("/lessons/{lesson_id}/reopen", dependencies=lecturer)
 def reopen_lesson(
     lesson_id: int,
-    payload: OpenSessionRequest | None = None,
+    payload: OpenSessionRequest,
     request: Request = None,
     db: Session = Depends(get_db),
 ):
-    port = payload.frontend_port if payload else None
-    base_url = resolve_app_base_url(request, payload.base_url if payload else None, port)
-    lecturer_ip = get_client_ip(request)
+    port = payload.frontend_port
+    base_url = resolve_app_base_url(request, payload.base_url, port)
     try:
         lesson = service.reopen_lesson(
             db,
             lesson_id,
             port,
             base_url=base_url,
-            lecturer_ip=lecturer_ip,
+            latitude=payload.latitude,
+            longitude=payload.longitude,
+            radius_meters=payload.radius_meters,
         )
     except AttendanceError as exc:
         return _error(exc)
@@ -264,7 +222,9 @@ def rename_lesson(
                 lesson_id,
                 payload.frontend_port,
                 base_url=base_url,
-                lecturer_ip=get_client_ip(request),
+                latitude=payload.latitude,
+                longitude=payload.longitude,
+                radius_meters=payload.radius_meters,
             )
             if clean_title:
                 lesson = service.rename_lesson(db, lesson_id, clean_title)
@@ -348,8 +308,11 @@ def session_qr(session_id: int, db: Session = Depends(get_db)):
     lesson = db.get(Lesson, session_id)
     if lesson is None:
         return JSONResponse(status_code=404, content={"detail": "Lesson not found."})
-    return Response(content=service.render_qr_png(lesson.checkin_url), media_type="image/png",
-                    headers={"Cache-Control": "no-store"})
+    return Response(
+        content=service.render_qr_png(lesson.checkin_url),
+        media_type="image/png",
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 @router.get("/export", dependencies=lecturer)
@@ -367,8 +330,11 @@ def export(
         )
     except AttendanceError as exc:
         return _error(exc)
-    return Response(content=content, media_type=media_type,
-                    headers={"Content-Disposition": f'attachment; filename="{filename}"'})
+    return Response(
+        content=content,
+        media_type=media_type,
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @router.get("/export-course", dependencies=lecturer)
@@ -381,8 +347,11 @@ def export_course(
         content, media_type, filename = service.export_course_summary(db, course_id, fmt)
     except AttendanceError as exc:
         return _error(exc)
-    return Response(content=content, media_type=media_type,
-                    headers={"Content-Disposition": f'attachment; filename="{filename}"'})
+    return Response(
+        content=content,
+        media_type=media_type,
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @router.post("/manual", dependencies=lecturer)

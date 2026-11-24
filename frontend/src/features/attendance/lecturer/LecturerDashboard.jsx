@@ -4,6 +4,7 @@ import { ROLES, useRole } from '../../../context/RoleContext.jsx'
 import { formatClock, useCountdown } from '../../../hooks/useCountdown.js'
 import { usePolling } from '../../../hooks/usePolling.js'
 import { csvTextToXlsxBlob } from '../../../utils/xlsxFallback.js'
+import LocationPickerMap, { DEFAULT_CAMPUS_COORDS } from './LocationPickerMap.jsx'
 
 const STATUS_META = {
   present: { label: 'QR Check-in', badge: 'badge--success' },
@@ -46,6 +47,8 @@ function formatLessonHeading(lesson) {
   return `${base}: ${lesson.title}`
 }
 
+const RADIUS_PRESETS = [30, 50, 100, 200]
+
 export default function LecturerDashboard() {
   const { setRole, setAiSettingsOpen } = useRole()
   const fileInputRef = useRef(null)
@@ -55,6 +58,8 @@ export default function LecturerDashboard() {
   const [selectedCourseId, setSelectedCourseId] = useState(null)
   const [selectedLessonId, setSelectedLessonId] = useState(null)
   const [manualHeadcount, setManualHeadcount] = useState('')
+  const [radiusMeters, setRadiusMeters] = useState(50)
+  const [mapCoords, setMapCoords] = useState(DEFAULT_CAMPUS_COORDS)
 
   // New Course modal/inline drawer state (with optional roster file upload)
   const [showNewCourse, setShowNewCourse] = useState(false)
@@ -244,12 +249,18 @@ export default function LecturerDashboard() {
 
   const handleOpenSession = async (event) => {
     if (event) event.preventDefault()
+    const cleanRadius = Math.max(5, Math.min(5000, Number(radiusMeters) || 50))
+    const lat = Number(mapCoords?.latitude ?? DEFAULT_CAMPUS_COORDS.latitude)
+    const lng = Number(mapCoords?.longitude ?? DEFAULT_CAMPUS_COORDS.longitude)
     setBusyAction('open')
     setBanner(null)
     try {
       const opened = await api.post('/api/attendance/sessions/open', {
         course_id: course?.id,
         title: nextLessonTitle.trim() || null,
+        latitude: lat,
+        longitude: lng,
+        radius_meters: cleanRadius,
         base_url: window.location.origin,
         frontend_port: detectFrontendPort(),
       })
@@ -259,7 +270,7 @@ export default function LecturerDashboard() {
       await refresh()
       showBanner(
         'success',
-        `Opened ${formatLessonHeading(opened)} for "${course?.name}". Classroom network lock active (${opened.lecturer_subnet || 'same Wi-Fi /24'}).`,
+        `Opened ${formatLessonHeading(opened)} for "${course?.name}". GPS Radius Lock active (${Math.round(opened.radius_meters || cleanRadius)}m around ${lat.toFixed(5)}, ${lng.toFixed(5)}).`,
       )
     } catch (err) {
       showBanner('danger', err.message)
@@ -270,16 +281,22 @@ export default function LecturerDashboard() {
 
   const handleReopenLesson = async () => {
     if (!session) return
+    const cleanRadius = Math.max(5, Math.min(5000, Number(radiusMeters) || session.radius_meters || 50))
+    const lat = Number(mapCoords?.latitude ?? session.latitude ?? DEFAULT_CAMPUS_COORDS.latitude)
+    const lng = Number(mapCoords?.longitude ?? session.longitude ?? DEFAULT_CAMPUS_COORDS.longitude)
     setBusyAction('reopen')
     setBanner(null)
-    const payload = {
-      course_id: course?.id,
-      lesson_id: session.id,
-      title: session.title,
-      base_url: window.location.origin,
-      frontend_port: detectFrontendPort(),
-    }
     try {
+      const payload = {
+        course_id: course?.id,
+        lesson_id: session.id,
+        title: session.title,
+        latitude: lat,
+        longitude: lng,
+        radius_meters: cleanRadius,
+        base_url: window.location.origin,
+        frontend_port: detectFrontendPort(),
+      }
       let reopened
       try {
         reopened = await api.post(`/api/attendance/lessons/${session.id}/reopen`, payload)
@@ -290,6 +307,9 @@ export default function LecturerDashboard() {
           reopened = await api.patch(`/api/attendance/lessons/${session.id}`, {
             title: `__REOPEN__:${currentTitle}`,
             reopen: true,
+            latitude: lat,
+            longitude: lng,
+            radius_meters: cleanRadius,
             base_url: window.location.origin,
             frontend_port: detectFrontendPort(),
           })
@@ -300,7 +320,10 @@ export default function LecturerDashboard() {
       setSelectedCourseId(reopened.course_id || course?.id)
       setSelectedLessonId(reopened.id || session.id)
       await refresh()
-      showBanner('success', `Re-opened QR attendance for ${formatLessonHeading(session)} (15 minutes).`)
+      showBanner(
+        'success',
+        `Re-opened QR attendance for ${formatLessonHeading(session)} (15 minutes, allowed radius: ${Math.round(cleanRadius)}m around ${lat.toFixed(5)}, ${lng.toFixed(5)}).`,
+      )
     } catch (err) {
       showBanner('danger', err.message)
     } finally {
@@ -516,27 +539,6 @@ export default function LecturerDashboard() {
     }
   }
 
-  const handleToggleNetworkOverride = async (nextChecked) => {
-    if (!session) return
-    setBusyAction('network-override')
-    try {
-      await api.patch(`/api/attendance/lessons/${session.id}/network-override`, {
-        allow_any_network: Boolean(nextChecked),
-      })
-      await refresh()
-      showBanner(
-        nextChecked ? 'info' : 'success',
-        nextChecked
-          ? '⚠️ Demo Override ON: Current session allows check-ins without Wi-Fi IP/ASN restriction.'
-          : '🔒 Strict Classroom Wi-Fi Network Lock restored for current session.',
-      )
-    } catch (err) {
-      showBanner('danger', err.message)
-    } finally {
-      setBusyAction(null)
-    }
-  }
-
   const handlePhotoUpload = async (event) => {
     const file = event.target.files?.[0]
     event.target.value = ''
@@ -634,7 +636,6 @@ export default function LecturerDashboard() {
   const students = dashboard?.students || []
   const alerts = dashboard?.alerts || []
   const stats = dashboard?.stats || { roster_size: 0, present: 0, absent: 0, unlisted: 0, manual: 0 }
-  const network = dashboard?.network || null
 
   const filteredStudents = students.filter((s) => {
     const statusKey = s.status || 'absent'
@@ -655,18 +656,22 @@ export default function LecturerDashboard() {
 
   return (
     <div className="dashboard">
-      {/* Top Network & Demo Info Strip */}
+      {/* Top Geolocation & Demo Info Strip */}
       <div className="network-bar">
         <div className="network-bar__left">
           <span className="network-pill">
             <span className="status-dot status-dot--live" aria-hidden="true" />
-            Classroom Network Lock: <code>{session?.lecturer_subnet || network?.subnet || '127.0.0.0/24'}</code>
+            📍 Classroom Geolocation Radius:{' '}
+            <code>{Math.round(session?.radius_meters ?? radiusMeters ?? 50)}m</code>
           </span>
-          {network && (
-            <span className="network-meta">
-              Lecturer IP: <code>{session?.lecturer_ip || network.lecturer_ip || network.lan_ip}</code>
-            </span>
-          )}
+          {session?.latitude !== null &&
+            session?.latitude !== undefined &&
+            session?.longitude !== null &&
+            session?.longitude !== undefined && (
+              <span className="network-meta">
+                Session GPS: <code>{Number(session.latitude).toFixed(5)}, {Number(session.longitude).toFixed(5)}</code>
+              </span>
+            )}
         </div>
         <div className="network-bar__right">
           <button
@@ -1011,7 +1016,9 @@ export default function LecturerDashboard() {
                 </div>
 
                 <div className="qr-url-box">
-                  <span className="qr-url-box__label">LAN Check-in URL (same Wi-Fi required)</span>
+                  <span className="qr-url-box__label">
+                    Student Check-in URL (📍 Allowed GPS Radius: {Math.round(session.radius_meters || 50)}m)
+                  </span>
                   <code className="qr-url-box__code">{session.checkin_url}</code>
                   <div className="qr-url-box__actions">
                     <button type="button" className="btn btn--secondary btn--sm" onClick={handleCopyUrl}>
@@ -1042,13 +1049,51 @@ export default function LecturerDashboard() {
           ) : (
             <div className="qr-closed">
               <div className="qr-closed__placeholder" aria-hidden="true">
-                <span>📱</span>
+                <span>📍</span>
               </div>
               <p className="muted">
                 {session
-                  ? `Viewing ${formatLessonHeading(session)} (${formatShortDate(session.opened_at)}). You can edit students and mark נוכח / לא נוכח in the table below, re-open the QR for this lesson, or start the next lesson:`
-                  : `Course "${course?.name}" has ${students.length} student(s) saved in its roster. Open Lesson 1 below and the entire roster will load automatically:`}
+                  ? `Viewing ${formatLessonHeading(session)} (${formatShortDate(session.opened_at)}). Set the allowed classroom GPS radius below to re-open the QR for this lesson or start the next lesson:`
+                  : `Course "${course?.name}" has ${students.length} student(s) saved in its roster. Set the allowed classroom GPS radius and open Lesson 1 below:`}
               </p>
+
+              {/* Interactive Classroom Map Picker + Allowed Radius Control */}
+              <div className="qr-url-box" style={{ width: '100%', textAlign: 'left', marginBottom: '0.75rem' }}>
+                <label className="field" style={{ marginBottom: '0.45rem' }}>
+                  <span>
+                    📍 Classroom Location & Allowed Radius (meters) <span className="required">*</span>
+                  </span>
+                  <div className="context-group__controls" style={{ display: 'flex', gap: '0.45rem', flexWrap: 'wrap' }}>
+                    <input
+                      type="number"
+                      min={5}
+                      max={5000}
+                      step={5}
+                      style={{ width: '110px' }}
+                      value={radiusMeters}
+                      onChange={(e) => setRadiusMeters(e.target.value)}
+                      aria-label="Allowed classroom radius in meters"
+                    />
+                    {RADIUS_PRESETS.map((preset) => (
+                      <button
+                        key={preset}
+                        type="button"
+                        className={`filter-pill ${Number(radiusMeters) === preset ? 'is-active' : ''}`}
+                        onClick={() => setRadiusMeters(preset)}
+                      >
+                        {preset}m
+                      </button>
+                    ))}
+                  </div>
+                </label>
+
+                <LocationPickerMap
+                  latitude={mapCoords.latitude}
+                  longitude={mapCoords.longitude}
+                  radiusMeters={Number(radiusMeters) || 50}
+                  onChange={setMapCoords}
+                />
+              </div>
 
               {session && (
                 <button
@@ -1059,7 +1104,7 @@ export default function LecturerDashboard() {
                 >
                   {busyAction === 'reopen'
                     ? 'Re-opening…'
-                    : `🔄 Re-open QR for ${formatLessonHeading(session)} (15:00)`}
+                    : `🔄 Re-open QR for ${formatLessonHeading(session)} (${radiusMeters || 50}m radius)`}
                 </button>
               )}
 
@@ -1085,63 +1130,11 @@ export default function LecturerDashboard() {
                 >
                   {busyAction === 'open'
                     ? 'Opening…'
-                    : `▶ Open ${nextLessonTitle.trim() ? `Lesson ${nextLessonNum}: ${nextLessonTitle.trim()}` : nextLessonDefault} (15:00)`}
+                    : `▶ Open ${nextLessonTitle.trim() ? `Lesson ${nextLessonNum}: ${nextLessonTitle.trim()}` : nextLessonDefault} (${radiusMeters || 50}m GPS Radius)`}
                 </button>
               </form>
             </div>
           )}
-
-          {/* Live Network Diagnostic & Demo Override Box */}
-          <div className="qr-url-box" style={{ marginTop: '1rem' }} aria-label="Network Diagnostic Box">
-            <span className="qr-url-box__label">📡 Live Network & Cloudflare Tunnel Diagnostic</span>
-            <div style={{ display: 'grid', gap: '0.3rem', fontSize: '0.88rem', marginTop: '0.25rem' }}>
-              <div>
-                <strong>QR Code URL:</strong>{' '}
-                <code>{session?.checkin_url || `${window.location.origin}/attendance/checkin?token=...`}</code>
-              </div>
-              <div>
-                <strong>Lecturer Detected Request IP:</strong>{' '}
-                <code>{network?.detected_request_ip || session?.lecturer_ip || network?.lan_ip || '127.0.0.1'}</code>
-                {' · '}
-                <strong>Local LAN IP:</strong> <code>{network?.lan_ip || '127.0.0.1'}</code>
-              </div>
-              <div>
-                <strong>Lecturer Public IP (Router / Tunnel):</strong>{' '}
-                <code>{network?.public_ip || session?.lecturer_ip || 'Detecting…'}</code>
-                {' · '}
-                <strong>Active Subnet Lock:</strong>{' '}
-                <code>{network?.subnet || session?.lecturer_subnet || '127.0.0.0/24'}</code>
-              </div>
-              <div>
-                <strong>ISP / Organization ASN:</strong>{' '}
-                <code>
-                  {network?.asn ? `${network.asn}${network?.org ? ` (${network.org})` : ''}` : 'Local LAN'}
-                </code>
-              </div>
-            </div>
-
-            {session && (
-              <label
-                className="checkbox-label"
-                style={{
-                  marginTop: '0.65rem',
-                  paddingTop: '0.55rem',
-                  borderTop: '1px solid rgba(148, 163, 184, 0.25)',
-                }}
-              >
-                <input
-                  type="checkbox"
-                  checked={Boolean(network?.allow_any_network)}
-                  disabled={busyAction === 'network-override'}
-                  onChange={(e) => handleToggleNetworkOverride(e.target.checked)}
-                />
-                <span>
-                  <strong>Demo Override: Allow Current Session Without IP Check</strong>{' '}
-                  <span className="muted">(Safety net for live class presentation; off by default)</span>
-                </span>
-              </label>
-            )}
-          </div>
         </section>
 
         {/* Right Column: Stats, Roster Import/Export & Manual Add Student */}
@@ -1457,6 +1450,7 @@ export default function LecturerDashboard() {
                   <th>Email</th>
                   <th>Presence (נוכח / לא נוכח)</th>
                   <th>Source</th>
+                  <th>GPS Distance</th>
                   <th>Check-in Time</th>
                   <th className="text-right">Lecturer Actions (Edit / Toggle)</th>
                 </tr>
@@ -1527,6 +1521,11 @@ export default function LecturerDashboard() {
                       </td>
                       <td>
                         <span className={`badge ${meta.badge}`}>{meta.label}</span>
+                      </td>
+                      <td>
+                        {student.distance_meters !== null && student.distance_meters !== undefined
+                          ? <code>{Math.round(student.distance_meters)}m</code>
+                          : '—'}
                       </td>
                       <td>
                         <code>{formatTime(student.checked_in_at)}</code>

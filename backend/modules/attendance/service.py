@@ -1,7 +1,8 @@
-"""Attendance business logic: lessons/sessions, QR check-in, device lockout, dashboard, export."""
+"""Attendance business logic: lessons/sessions, GPS + Radius QR check-in, device lockout, dashboard, export."""
 from __future__ import annotations
 
 import io
+import math
 import re
 import secrets
 import threading
@@ -20,19 +21,7 @@ from sqlalchemy.orm import Session
 
 from core import config
 from core.database import iso_utc, utcnow
-from core.network import (
-    build_lecturer_network_lock,
-    compute_subnet,
-    detect_host_public_ip,
-    get_network_info,
-    is_private_or_loopback,
-    is_same_classroom_net,
-    lookup_ip_asn,
-    normalize_ip,
-    parse_network_profile,
-    resolve_app_base_url,
-    verify_classroom_network,
-)
+from core.network import resolve_app_base_url
 from modules.attendance.models import (
     LESSON_CLOSED,
     LESSON_OPEN,
@@ -56,6 +45,22 @@ from modules.roster.service import (
 
 # Serialises check-ins so two simultaneous requests from one device can't both pass the lock check.
 _checkin_lock = threading.Lock()
+EARTH_RADIUS_METERS = 6_371_000.0
+
+
+def calculate_distance_meters(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Calculate the great-circle distance in meters between two GPS coordinates using the Haversine formula."""
+    phi1 = math.radians(float(lat1))
+    phi2 = math.radians(float(lat2))
+    delta_phi = math.radians(float(lat2) - float(lat1))
+    delta_lambda = math.radians(float(lon2) - float(lon1))
+
+    a = (
+        math.sin(delta_phi / 2.0) ** 2
+        + math.cos(phi1) * math.cos(phi2) * (math.sin(delta_lambda / 2.0) ** 2)
+    )
+    c = 2.0 * math.atan2(math.sqrt(a), math.sqrt(max(0.0, 1.0 - a)))
+    return round(EARTH_RADIUS_METERS * c, 2)
 
 
 class AttendanceError(Exception):
@@ -132,8 +137,9 @@ def open_session(
     course_id: int | None = None,
     title: str | None = None,
     base_url: str | None = None,
-    lecturer_ip: str | None = None,
-    allow_any_network: bool = False,
+    latitude: float = 0.0,
+    longitude: float = 0.0,
+    radius_meters: float = 50.0,
 ) -> Lesson:
     course = resolve_course(db, course_id)
     now = utcnow()
@@ -148,9 +154,6 @@ def open_session(
     num = next_lesson_number(db, course.id)
     lesson_title = clean_text(title) or f"Lesson {num}"
     token = secrets.token_urlsafe(18)
-    effective_ip, encoded_subnet = build_lecturer_network_lock(
-        lecturer_ip, allow_any_network=allow_any_network
-    )
 
     # Reset is_present to False ("לא נוכח") for all students in this course when a new lesson starts.
     db.execute(
@@ -164,8 +167,9 @@ def open_session(
         status=LESSON_OPEN,
         qr_token=token,
         checkin_url=build_checkin_url(token, frontend_port=frontend_port, base_url=base_url),
-        lecturer_ip=effective_ip,
-        lecturer_subnet=encoded_subnet,
+        latitude=float(latitude),
+        longitude=float(longitude),
+        radius_meters=float(radius_meters),
         opened_at=now,
         expires_at=now + timedelta(seconds=config.SESSION_DURATION_SECONDS),
     )
@@ -180,8 +184,9 @@ def reopen_lesson(
     lesson_id: int,
     frontend_port: int | None,
     base_url: str | None = None,
-    lecturer_ip: str | None = None,
-    allow_any_network: bool | None = None,
+    latitude: float | None = None,
+    longitude: float | None = None,
+    radius_meters: float | None = None,
 ) -> Lesson:
     """Re-open an existing lesson's QR session for another 15 minutes."""
     lesson = db.get(Lesson, lesson_id)
@@ -194,46 +199,19 @@ def reopen_lesson(
         active.status = LESSON_CLOSED
         active.closed_at = now
 
-    existing_profile = parse_network_profile(lesson.lecturer_ip, lesson.lecturer_subnet)
-    override_flag = (
-        allow_any_network
-        if allow_any_network is not None
-        else existing_profile["allow_any_network"]
-    )
-
     token = secrets.token_urlsafe(18)
-    raw_ip = lecturer_ip or lesson.lecturer_ip or "127.0.0.1"
-    effective_ip, encoded_subnet = build_lecturer_network_lock(
-        raw_ip, allow_any_network=override_flag
-    )
     lesson.status = LESSON_OPEN
     lesson.closed_at = None
     lesson.opened_at = now
     lesson.expires_at = now + timedelta(seconds=config.SESSION_DURATION_SECONDS)
     lesson.qr_token = token
     lesson.checkin_url = build_checkin_url(token, frontend_port=frontend_port, base_url=base_url)
-    lesson.lecturer_ip = effective_ip
-    lesson.lecturer_subnet = encoded_subnet
-    db.commit()
-    db.refresh(lesson)
-    return lesson
-
-
-def toggle_session_network_override(
-    db: Session,
-    lesson_id: int,
-    allow_any_network: bool,
-    lecturer_ip: str | None = None,
-) -> Lesson:
-    lesson = db.get(Lesson, lesson_id)
-    if lesson is None:
-        raise AttendanceError(404, "Lesson not found.")
-    raw_ip = lecturer_ip or lesson.lecturer_ip or "127.0.0.1"
-    effective_ip, encoded_subnet = build_lecturer_network_lock(
-        raw_ip, allow_any_network=allow_any_network
-    )
-    lesson.lecturer_ip = effective_ip
-    lesson.lecturer_subnet = encoded_subnet
+    if latitude is not None:
+        lesson.latitude = float(latitude)
+    if longitude is not None:
+        lesson.longitude = float(longitude)
+    if radius_meters is not None:
+        lesson.radius_meters = float(radius_meters)
     db.commit()
     db.refresh(lesson)
     return lesson
@@ -417,7 +395,6 @@ class DeviceIdentity:
     cookie_token: str | None
     fingerprint: str | None
     device_id: str | None
-    client_ip: str
 
 
 def device_lock_remaining(db: Session, device: DeviceIdentity) -> int:
@@ -428,11 +405,7 @@ def device_lock_remaining(db: Session, device: DeviceIdentity) -> int:
     if device.device_id:
         conditions.append(DeviceLock.device_id == device.device_id)
     if device.fingerprint:
-        if config.STRICT_FINGERPRINT_LOCK:
-            conditions.append(DeviceLock.fingerprint == device.fingerprint)
-        else:
-            conditions.append((DeviceLock.fingerprint == device.fingerprint)
-                              & (DeviceLock.client_ip == device.client_ip))
+        conditions.append(DeviceLock.fingerprint == device.fingerprint)
     if not conditions:
         return 0
     now = utcnow()
@@ -480,6 +453,8 @@ def check_in(
     full_name: str,
     id_number: str | None,
     email: str | None,
+    latitude: float | None,
+    longitude: float | None,
     device: DeviceIdentity,
 ) -> CheckInResult:
     with _checkin_lock:
@@ -487,17 +462,34 @@ def check_in(
         if lesson is None or not secrets.compare_digest(lesson.qr_token, token):
             raise AttendanceError(410, "Attendance is currently closed or this QR code has expired.")
 
-        net_ok, net_reason, net_diag = verify_classroom_network(
-            device.client_ip, lesson.lecturer_ip, lesson.lecturer_subnet
-        )
-        if not net_ok:
+        if latitude is None or longitude is None:
             raise AttendanceError(
-                403,
-                net_reason,
-                network_diagnostic=net_diag,
+                400,
+                "GPS location coordinates (latitude and longitude) are required to check in. "
+                "Please enable location services in your browser and try again.",
             )
 
-        effective_fp = device.fingerprint or (f"fp_id_{device.device_id}" if device.device_id else f"fp_ip_{device.client_ip}")
+        distance_meters: float | None = None
+        if lesson.latitude is not None and lesson.longitude is not None:
+            distance_meters = calculate_distance_meters(
+                lesson.latitude,
+                lesson.longitude,
+                latitude,
+                longitude,
+            )
+            allowed_radius = float(lesson.radius_meters if lesson.radius_meters is not None else 50.0)
+            if distance_meters > allowed_radius:
+                raise AttendanceError(
+                    403,
+                    f"You are outside the allowed classroom radius "
+                    f"(Distance: {round(distance_meters)}m, Allowed: {round(allowed_radius)}m).",
+                    distance_meters=distance_meters,
+                    allowed_radius_meters=allowed_radius,
+                )
+
+        effective_fp = device.fingerprint or (f"fp_id_{device.device_id}" if device.device_id else None)
+        if not effective_fp:
+            raise AttendanceError(400, "Missing device fingerprint. Please reload the page and try again.")
         device.fingerprint = effective_fp
 
         remaining = device_lock_remaining(db, device)
@@ -555,12 +547,14 @@ def check_in(
             timestamp=now,
             status=STATUS_UNLISTED if unlisted else STATUS_PRESENT,
             device_fingerprint=device.fingerprint,
+            student_latitude=float(latitude),
+            student_longitude=float(longitude),
+            distance_meters=distance_meters,
         )
         lock = DeviceLock(
             cookie_token=secrets.token_urlsafe(24),
             fingerprint=device.fingerprint,
             device_id=device.device_id,
-            client_ip=device.client_ip,
             lesson_id=lesson.id,
             student_id=student.id,
             created_at=now,
@@ -728,6 +722,9 @@ def _attendance_rows(db: Session, course_id: int, lesson: Lesson | None) -> list
             "presence_label": "נוכח" if present_flag else "לא נוכח",
             "status": status,
             "checked_in_at": iso_utc(record.timestamp) if record else None,
+            "student_latitude": record.student_latitude if record else None,
+            "student_longitude": record.student_longitude if record else None,
+            "distance_meters": record.distance_meters if record else None,
             "_timestamp": record.timestamp if record else None,
         })
     if dirty:
@@ -739,7 +736,6 @@ def build_dashboard(
     db: Session,
     course_id: int | None = None,
     lesson_id: int | None = None,
-    client_ip: str | None = None,
 ) -> dict:
     _sync_expired_lessons(db)
     courses = list_courses(db)
@@ -796,27 +792,6 @@ def build_dashboard(
     roster_size = sum(1 for r in rows if r["in_roster"])
     next_num = next_lesson_number(db, selected_course.id)
 
-    ref_lesson = active_global or selected_lesson
-    detected_req_ip = normalize_ip(client_ip or get_network_info().lan_ip)
-    net_ip = (
-        ref_lesson.lecturer_ip
-        if (ref_lesson and ref_lesson.lecturer_ip)
-        else detected_req_ip
-    )
-    raw_subnet = (
-        ref_lesson.lecturer_subnet
-        if (ref_lesson and ref_lesson.lecturer_subnet)
-        else compute_subnet(net_ip)
-    )
-    profile = parse_network_profile(net_ip, raw_subnet)
-    public_ip = (
-        profile["public_ip"]
-        or (net_ip if not is_private_or_loopback(net_ip) else None)
-        or (detected_req_ip if not is_private_or_loopback(detected_req_ip) else None)
-        or detect_host_public_ip()
-    )
-    asn_info = lookup_ip_asn(public_ip) if public_ip else {"asn": profile["asn"] or "LOCAL", "org": "Local LAN"}
-
     return {
         "courses": courses,
         "course": selected_course.to_dict(),
@@ -840,17 +815,6 @@ def build_dashboard(
             "absent": len(rows) - present,
             "unlisted": sum(1 for r in rows if r["status"] == STATUS_UNLISTED),
             "manual": sum(1 for r in rows if r["status"] == STATUS_MANUAL),
-        },
-        "network": {
-            "lecturer_ip": net_ip,
-            "detected_request_ip": detected_req_ip,
-            "lan_ip": get_network_info().lan_ip,
-            "public_ip": public_ip,
-            "subnet": profile["primary_subnet"],
-            "raw_subnet": raw_subnet,
-            "asn": profile["asn"] or asn_info.get("asn"),
-            "org": asn_info.get("org"),
-            "allow_any_network": profile["allow_any_network"],
         },
         "server_time": iso_utc(utcnow()),
     }

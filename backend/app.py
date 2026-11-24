@@ -19,15 +19,6 @@ from pydantic import BaseModel
 from core import config
 from core.ai import AIError, extract_ai_config, list_provider_models, test_ai_connection
 from core.database import init_db
-from core.network import (
-    LanGuardMiddleware,
-    compute_subnet,
-    detect_host_public_ip,
-    get_client_ip,
-    get_network_info,
-    is_host_ip,
-    lookup_ip_asn,
-)
 from modules.attendance.router import router as attendance_router
 from modules.comments.router import router as comments_router
 from modules.homework.router import router as homework_router
@@ -39,23 +30,20 @@ from modules.summary.router import router as summary_router
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     init_db()
-    info = get_network_info(force_refresh=True)
     bar = "=" * 64
     print(f"\n{bar}\n  Teaching Platform API")
     print(f"  Local:    http://localhost:{config.PORT}/api/health")
-    print(f"  LAN:      http://{info.lan_ip}:{config.PORT}/api/health")
     if config.PUBLIC_APP_URL:
         print(f"  Public:   {config.PUBLIC_APP_URL}")
     print(f"  Database: {config.DATABASE_SUMMARY}")
     if config.FRONTEND_DIST_DIR.exists():
-        print(f"  Serving built frontend at http://{info.lan_ip}:{config.PORT}/")
+        print(f"  Serving built frontend at http://localhost:{config.PORT}/")
     print(f"{bar}\n", flush=True)
     yield
 
 
 app = FastAPI(title="Teaching Platform API", version="2.0.0", lifespan=lifespan)
 
-app.add_middleware(LanGuardMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origin_regex=r"^https?://.*$",
@@ -119,26 +107,6 @@ def ai_test(payload: AITestRequest, request: Request):
         return test_ai_connection(cfg)
     except AIError as exc:
         return JSONResponse(status_code=exc.status_code, content={"detail": exc.message})
-
-
-@app.get("/api/network")
-def network(request: Request):
-    info = get_network_info()
-    client_ip = get_client_ip(request)
-    public_ip = detect_host_public_ip()
-    asn_info = lookup_ip_asn(public_ip or client_ip)
-    return {
-        "lan_ip": info.lan_ip,
-        "lecturer_ip": client_ip,
-        "public_ip": public_ip,
-        "subnet": compute_subnet(public_ip or client_ip),
-        "asn": asn_info.get("asn"),
-        "org": asn_info.get("org"),
-        "backend_port": config.PORT,
-        "client_ip": client_ip,
-        "is_lecturer_host": is_host_ip(client_ip),
-        "lecturer_host_only": config.LECTURER_HOST_ONLY,
-    }
 
 
 # --- Optional single-port mode: serve the built React app (npm run build) -------
