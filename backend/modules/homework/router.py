@@ -174,7 +174,7 @@ def list_submissions(
 
 
 @router.post("/submit")
-async def submit_homework(
+def submit_homework(
     request: Request,
     course_id: int | None = Form(default=None),
     assignment_name: str = Form(...),
@@ -202,7 +202,7 @@ async def submit_homework(
     elif file is not None and file.filename:
         submission_type = "file"
         source_label = file.filename
-        raw_bytes = await file.read()
+        raw_bytes = file.file.read()
         lower = file.filename.lower()
         if lower.endswith(".zip"):
             file_code = _extract_zip_bytes(raw_bytes)

@@ -9,6 +9,9 @@ const apiProxy = {
   '/api': {
     target: BACKEND,
     changeOrigin: false,
+    // Allow up to 10 minutes for large MP4 video uploads & Gemini File API processing
+    timeout: 600000,
+    proxyTimeout: 600000,
     // Do NOT set xfwd: true because Vite's http-proxy OVERWRITES Cloudflare's
     // X-Forwarded-For header with 127.0.0.1! Instead, explicitly preserve
     // CF-Connecting-IP and append/forward the original client IP cleanly.

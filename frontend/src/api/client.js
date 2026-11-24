@@ -75,6 +75,20 @@ async function request(method, path, { body, form, headers } = {}) {
   if (!response.ok) {
     let message = data?.detail
     if (Array.isArray(message)) message = message.map((d) => d.msg).join(', ')
+    if (!message && !isJson) {
+      try {
+        const rawText = (await response.text()).trim()
+        if (rawText && !rawText.startsWith('<!DOCTYPE') && !rawText.startsWith('<html')) {
+          message = rawText.slice(0, 240)
+        }
+      } catch {
+        /* ignore */
+      }
+    }
+    if (!message && response.status === 502) {
+      message =
+        'Gateway timeout (502): The video upload or AI processing took longer than the proxy timeout. Restart Vite (`npm run dev`) or try a shorter video clip.'
+    }
     throw new ApiError(response.status, message || `Request failed (${response.status})`, data)
   }
   return data

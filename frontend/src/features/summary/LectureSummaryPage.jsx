@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { api, getStoredLecturerPin } from '../../api/client.js'
+import { api, getStoredAiSettings, getStoredLecturerPin } from '../../api/client.js'
 import { ROLES, useRole } from '../../context/RoleContext.jsx'
 
 export default function LectureSummaryPage() {
@@ -10,12 +10,15 @@ export default function LectureSummaryPage() {
   const [selectedCourseId, setSelectedCourseId] = useState(null)
   const [lessons, setLessons] = useState([])
   const [selectedLessonId, setSelectedLessonId] = useState('')
+  const [recordingLanguage, setRecordingLanguage] = useState('auto')
+  const [youtubeUrl, setYoutubeUrl] = useState('')
   const [transcript, setTranscript] = useState('')
   const [selectedFile, setSelectedFile] = useState(null)
 
   const [summaries, setSummaries] = useState([])
   const [activeSummary, setActiveSummary] = useState(null)
   const [generating, setGenerating] = useState(false)
+  const [statusStep, setStatusStep] = useState('')
   const [banner, setBanner] = useState(null)
 
   useEffect(() => {
@@ -74,35 +77,80 @@ export default function LectureSummaryPage() {
 
   const handleGenerate = async (event) => {
     event.preventDefault()
-    if (!selectedFile && !transcript.trim()) {
+    if (!youtubeUrl.trim() && !selectedFile && !transcript.trim()) {
       setBanner({
         tone: 'danger',
-        text: 'Please upload a lecture video/audio/transcript file or paste a Zoom/Meet transcript.',
+        text: 'Please enter a YouTube URL, upload a lecture video/audio file (.mp4, .mov, .webm), or paste a transcript.',
       })
       return
     }
     setGenerating(true)
     setBanner(null)
+
+    if (youtubeUrl.trim()) {
+      setStatusStep('📺 Extracting YouTube transcript & generating AI lecture evaluation…')
+    } else if (selectedFile) {
+      setStatusStep(
+        `🎵 Uploading "${selectedFile.name}" for FFmpeg 16 kHz mono audio extraction & speech transcription…`,
+      )
+    } else {
+      setStatusStep('🤖 Analyzing lecture transcript & evaluating pedagogy…')
+    }
+
     try {
+      const ai = getStoredAiSettings()
+      const isMediaUpload = Boolean(
+        selectedFile && !/\.(txt|vtt|srt|md|csv)$/i.test(selectedFile.name || ''),
+      )
       const form = new FormData()
       if (selectedCourseId) form.append('course_id', String(selectedCourseId))
       if (selectedLessonId) form.append('lesson_id', String(selectedLessonId))
+      if (recordingLanguage && recordingLanguage !== 'auto') {
+        form.append('language', recordingLanguage)
+      }
+      if (isMediaUpload) {
+        form.append('async_job', 'true')
+      }
+      if (youtubeUrl.trim()) form.append('youtube_url', youtubeUrl.trim())
       if (transcript.trim()) form.append('transcript', transcript.trim())
+      if (ai.provider) form.append('provider', ai.provider)
+      if (ai.apiKey) form.append('api_key', ai.apiKey)
+      if (ai.model) form.append('model', ai.model)
       if (selectedFile) form.append('file', selectedFile)
 
-      const created = await api.uploadForm('/api/summaries/generate', form)
+      let created = await api.uploadForm('/api/summaries/generate', form)
+
+      if (created?.job_id && created.status !== 'completed') {
+        const jobId = created.job_id
+        if (created.stage) setStatusStep(created.stage)
+        while (true) {
+          await new Promise((resolve) => window.setTimeout(resolve, 2000))
+          const job = await api.get(`/api/summaries/jobs/${encodeURIComponent(jobId)}`)
+          if (job.stage) setStatusStep(job.stage)
+          if (job.status === 'completed' && job.summary) {
+            created = job.summary
+            break
+          }
+          if (job.status === 'failed') {
+            throw new Error(job.detail || 'Lecture audio processing failed.')
+          }
+        }
+      }
+
       setSummaries((prev) => [created, ...prev])
       setActiveSummary(created)
       setSelectedFile(null)
+      setYoutubeUrl('')
       if (fileInputRef.current) fileInputRef.current.value = ''
       setBanner({
         tone: 'success',
-        text: `🧠 Generated pedagogical evaluation report using ${created.ai_provider}.`,
+        text: `🧠 Generated pedagogical evaluation report for "${created.source_filename}" using ${created.ai_provider}.`,
       })
     } catch (err) {
       setBanner({ tone: 'danger', text: err.message })
     } finally {
       setGenerating(false)
+      setStatusStep('')
     }
   }
 
@@ -194,7 +242,7 @@ export default function LectureSummaryPage() {
       </section>
 
       {banner && (
-        <div className={`notice notice--${banner.tone} notice--dismissible`}>
+        <div className={`notice notice--${banner.tone} notice--dismissible`} role="alert">
           <span>{banner.text}</span>
           <button type="button" className="notice__close" onClick={() => setBanner(null)}>
             ✕
@@ -203,42 +251,75 @@ export default function LectureSummaryPage() {
       )}
 
       <div className="dashboard__grid">
-        {/* Left: Upload Lecture Video / Transcript */}
+        {/* Left: YouTube URL / Upload Lecture Video / Transcript */}
         <section className="card">
           <div className="card__header">
             <div>
               <h2>🧠 Generate ML Lecture Summary & Teaching Evaluation</h2>
               <p className="muted">
-                Upload a recorded lecture video (<code>.mp4</code>, <code>.mov</code>, <code>.webm</code>) or Zoom/Meet transcript to evaluate pedagogical quality.
+                Summarize any YouTube lecture URL, upload a recorded video file (<code>.mp4</code>, <code>.mov</code>, <code>.webm</code>), or paste a Zoom/Meet transcript.
               </p>
             </div>
             <span className="badge badge--info">Lecturer Only</span>
           </div>
 
           <form className="quick-form" onSubmit={handleGenerate}>
+            <div className="quick-form__grid" style={{ gridTemplateColumns: '1fr 1fr' }}>
+              <label className="field">
+                <span>Associate with Lesson</span>
+                <select
+                  className="select-input"
+                  value={selectedLessonId}
+                  onChange={(e) => setSelectedLessonId(e.target.value)}
+                  disabled={generating}
+                  dir="auto"
+                >
+                  <option value="">General Course Lecture</option>
+                  {lessons.map((l) => (
+                    <option key={l.id} value={l.id}>
+                      Lesson {l.lesson_number}: {l.title}
+                    </option>
+                  ))}
+                </select>
+              </label>
+
+              <label className="field">
+                <span>Recording Language</span>
+                <select
+                  className="select-input"
+                  value={recordingLanguage}
+                  onChange={(e) => setRecordingLanguage(e.target.value)}
+                  disabled={generating}
+                  dir="auto"
+                >
+                  <option value="auto">🌐 Auto-detect (עברית / English)</option>
+                  <option value="he">🇮🇱 עברית (Hebrew — he)</option>
+                  <option value="en">🇺🇸 English (en)</option>
+                </select>
+              </label>
+            </div>
+
             <label className="field">
-              <span>Associate with Lesson</span>
-              <select
-                className="select-input"
-                value={selectedLessonId}
-                onChange={(e) => setSelectedLessonId(e.target.value)}
-                dir="auto"
-              >
-                <option value="">General Course Lecture</option>
-                {lessons.map((l) => (
-                  <option key={l.id} value={l.id}>
-                    Lesson {l.lesson_number}: {l.title}
-                  </option>
-                ))}
-              </select>
+              <span>
+                📺 Option 1: YouTube Lecture URL <span className="optional">(fast transcript extraction via youtube-transcript-api)</span>
+              </span>
+              <input
+                type="url"
+                placeholder="https://www.youtube.com/watch?v=... or https://youtu.be/..."
+                value={youtubeUrl}
+                onChange={(e) => setYoutubeUrl(e.target.value)}
+                disabled={generating}
+              />
             </label>
 
             <div className="field">
-              <span>Upload Lecture Video, Audio, or Transcript File (.mp4, .mov, .webm, .txt, .vtt)</span>
+              <span>
+                🎬 Option 2: Upload Video, Audio, or Transcript File (<code>.mp4</code>, <code>.mov</code>, <code>.webm</code>, <code>.txt</code>, <code>.vtt</code>)
+              </span>
               <input
                 ref={fileInputRef}
                 type="file"
-                accept="video/*,audio/*,.mp4,.mov,.webm,.mp3,.wav,.txt,.vtt,.srt,.md"
+                accept="video/*,audio/*,.mp4,.mov,.webm,.mkv,.mp3,.wav,.txt,.vtt,.srt,.md"
                 onChange={(e) => setSelectedFile(e.target.files?.[0] || null)}
                 hidden
               />
@@ -247,13 +328,17 @@ export default function LectureSummaryPage() {
                   type="button"
                   className="btn btn--secondary"
                   onClick={() => fileInputRef.current?.click()}
+                  disabled={generating}
                 >
-                  {selectedFile ? `🎬 ${selectedFile.name}` : '📂 Choose Video or Transcript File'}
+                  {selectedFile
+                    ? `🎬 ${selectedFile.name} (${(selectedFile.size / (1024 * 1024)).toFixed(1)} MB)`
+                    : '📂 Choose Video or Transcript File'}
                 </button>
                 {selectedFile && (
                   <button
                     type="button"
                     className="btn btn--ghost btn--sm"
+                    disabled={generating}
                     onClick={() => {
                       setSelectedFile(null)
                       if (fileInputRef.current) fileInputRef.current.value = ''
@@ -274,20 +359,27 @@ export default function LectureSummaryPage() {
 
             <label className="field">
               <span>
-                Zoom / Meet Transcript or Lecture Notes <span className="optional">(or paste here)</span>
+                📝 Option 3: Zoom / Meet Transcript or Lecture Notes <span className="optional">(or paste here)</span>
               </span>
               <textarea
                 className="textarea-input"
-                rows={7}
-                placeholder="Paste the lecture transcript, auto-captions from Zoom/Google Meet, or lecture outline here…"
+                rows={6}
+                placeholder="Paste the lecture transcript, auto-captions from Zoom/Google Meet, or additional instructions here…"
                 value={transcript}
                 onChange={(e) => setTranscript(e.target.value)}
+                disabled={generating}
                 dir="auto"
               />
             </label>
 
+            {generating && statusStep && (
+              <div className="notice notice--info" role="status">
+                {statusStep}
+              </div>
+            )}
+
             <button type="submit" className="btn btn--primary btn--lg btn--block" disabled={generating}>
-              {generating ? '🤖 Analyzing Lecture & Evaluating Pedagogy…' : '🧠 Generate Pedagogical Evaluation Report'}
+              {generating ? '⏳ Processing Lecture & Generating Report…' : '🧠 Generate Pedagogical Evaluation Report'}
             </button>
           </form>
         </section>
@@ -298,7 +390,7 @@ export default function LectureSummaryPage() {
             <div className="empty-state">
               <p>No lecture evaluation report selected.</p>
               <p className="muted">
-                Upload a lecture video or paste a Zoom transcript on the left to generate a structured pedagogical report.
+                Enter a YouTube link, upload a lecture video, or paste a Zoom transcript on the left to generate a structured pedagogical report.
               </p>
             </div>
           ) : (
@@ -322,6 +414,13 @@ export default function LectureSummaryPage() {
                   <button
                     type="button"
                     className="btn btn--secondary btn--sm"
+                    onClick={() => handleDownload(activeSummary, 'pdf')}
+                  >
+                    ⬇ Download .pdf
+                  </button>
+                  <button
+                    type="button"
+                    className="btn btn--secondary btn--sm"
                     onClick={() => handleDownload(activeSummary, 'md')}
                   >
                     ⬇ Download .md
@@ -337,14 +436,14 @@ export default function LectureSummaryPage() {
               </div>
 
               <div className="report-section">
-                <h3>1. Executive Lecture Summary & Key Topics Covered</h3>
+                <h3>1. Overview, Executive Summary & Key Definitions</h3>
                 <div className="report-section__content" dir="auto">
                   {activeSummary.executive_summary}
                 </div>
               </div>
 
               <div className="report-section">
-                <h3>2. Pedagogical & Delivery Evaluation Parameters</h3>
+                <h3>2. Detailed Breakdown & Pedagogical Evaluation Parameters</h3>
                 <div className="report-section__content" dir="auto">
                   {activeSummary.pedagogical_evaluation}
                 </div>
@@ -365,7 +464,7 @@ export default function LectureSummaryPage() {
               </div>
 
               <div className="report-section">
-                <h3>5. Action Items / Topics to Revisit Next Class</h3>
+                <h3>5. Review Questions & Action Items for Next Class</h3>
                 <div className="report-section__content" dir="auto">
                   {activeSummary.action_items}
                 </div>

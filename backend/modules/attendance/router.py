@@ -245,13 +245,13 @@ def list_course_lessons(
 
 
 @router.post("/lessons/{lesson_id}/photo-headcount", dependencies=lecturer)
-async def upload_photo_headcount(
+def upload_photo_headcount(
     lesson_id: int,
     request: Request,
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
 ):
-    content = await file.read()
+    content = file.file.read()
     mime_type = (file.content_type or "image/jpeg").lower()
     if not mime_type.startswith("image/"):
         mime_type = "image/jpeg"

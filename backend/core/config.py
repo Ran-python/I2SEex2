@@ -89,3 +89,31 @@ OPENAI_API_KEY = (os.getenv("OPENAI_API_KEY") or "").strip() or None
 # Optional public base URL for QR codes (e.g. https://my-app.onrender.com).
 # When unset, the backend uses the origin URL passed by the lecturer's browser or Host headers.
 PUBLIC_APP_URL = (os.getenv("PUBLIC_APP_URL") or "").strip().rstrip("/") or None
+
+# --- MP4 Audio Preprocessing & Transcription Pipeline ---------------------
+FFMPEG_BIN = (os.getenv("FFMPEG_BIN") or "").strip() or None
+FFPROBE_BIN = (os.getenv("FFPROBE_BIN") or "").strip() or None
+
+# Maximum uploaded media file size in MB (streamed to disk, never loaded into RAM)
+MAX_VIDEO_UPLOAD_MB = float(os.getenv("MAX_VIDEO_UPLOAD_MB", "1024"))
+MAX_VIDEO_UPLOAD_BYTES = int(MAX_VIDEO_UPLOAD_MB * 1024 * 1024)
+MAX_MEDIA_DURATION_SECONDS = float(os.getenv("MAX_MEDIA_DURATION_SECONDS", str(5 * 3600)))
+
+# Audio preprocessing defaults (mono, 16 kHz, speech-optimized MP3)
+AUDIO_SAMPLE_RATE = int(os.getenv("AUDIO_SAMPLE_RATE", "16000"))
+AUDIO_CHANNELS = int(os.getenv("AUDIO_CHANNELS", "1"))
+AUDIO_BITRATE = (os.getenv("AUDIO_BITRATE") or "48k").strip()
+
+# Transcription upload size limit (OpenAI hard limit is 25 MB; default 20 MB leaves a 5 MB safety margin)
+OPENAI_HARD_LIMIT_MB = 25.0
+STT_MAX_UPLOAD_MB = float(os.getenv("STT_MAX_UPLOAD_MB", "20.0"))
+STT_MAX_UPLOAD_BYTES = int(STT_MAX_UPLOAD_MB * 1024 * 1024)
+
+# Chunking & overlap configuration
+AUDIO_CHUNK_TARGET_SECONDS = float(os.getenv("AUDIO_CHUNK_TARGET_SECONDS", "600.0"))
+AUDIO_CHUNK_OVERLAP_SECONDS = float(os.getenv("AUDIO_CHUNK_OVERLAP_SECONDS", "1.5"))
+TRANSCRIPTION_MAX_RETRIES = int(os.getenv("TRANSCRIPTION_MAX_RETRIES", "3"))
+TRANSCRIPTION_DEFAULT_LANGUAGE = (os.getenv("TRANSCRIPTION_DEFAULT_LANGUAGE") or "").strip().lower() or None
+OPENAI_STT_MODEL = (os.getenv("OPENAI_STT_MODEL") or "whisper-1").strip()
+STT_PROVIDER_OVERRIDE = (os.getenv("STT_PROVIDER") or "").strip().lower() or None
+SUMMARY_MAX_WORKERS = int(os.getenv("SUMMARY_MAX_WORKERS", "3"))
