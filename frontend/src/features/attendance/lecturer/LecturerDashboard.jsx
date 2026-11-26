@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { api } from '../../../api/client.js'
+import { api, getStoredLecturerPin } from '../../../api/client.js'
 import { ROLES, useRole } from '../../../context/RoleContext.jsx'
 import { formatClock, useCountdown } from '../../../hooks/useCountdown.js'
 import { usePolling } from '../../../hooks/usePolling.js'
@@ -50,7 +50,7 @@ function formatLessonHeading(lesson) {
 const RADIUS_PRESETS = [30, 50, 100, 200]
 
 export default function LecturerDashboard() {
-  const { setRole, setAiSettingsOpen } = useRole()
+  const { setRole } = useRole()
   const fileInputRef = useRef(null)
   const newCourseFileRef = useRef(null)
   const photoInputRef = useRef(null)
@@ -58,6 +58,8 @@ export default function LecturerDashboard() {
   const [selectedCourseId, setSelectedCourseId] = useState(null)
   const [selectedLessonId, setSelectedLessonId] = useState(null)
   const [manualHeadcount, setManualHeadcount] = useState('')
+  const [photoResultsByLesson, setPhotoResultsByLesson] = useState({})
+  const [zoomedPhotoUrl, setZoomedPhotoUrl] = useState(null)
   const [radiusMeters, setRadiusMeters] = useState(50)
   const [mapCoords, setMapCoords] = useState(DEFAULT_CAMPUS_COORDS)
 
@@ -547,16 +549,26 @@ export default function LecturerDashboard() {
     setBanner(null)
     try {
       const res = await api.upload(`/api/attendance/lessons/${session.id}/photo-headcount`, file)
+      setPhotoResultsByLesson((prev) => ({
+        ...prev,
+        [session.id]: {
+          annotatedImage: res.annotated_image || null,
+          detections: res.detections || [],
+          avgConfidence: res.avg_confidence ?? null,
+          headcount: res.photo_headcount,
+          filename: file.name,
+        },
+      }))
       await refresh()
       if (res.discrepancy_alert) {
         showBanner(
           'danger',
-          `🚨 Discrepancy Alert: ${res.registered_count} students marked present, but only ${res.photo_headcount} counted in "${file.name}" (${res.discrepancy} extra check-ins)!`,
+          `🚨 Discrepancy Alert: ${res.registered_count} students marked present, but YOLOv8 detected only ${res.photo_headcount} people in "${file.name}" (${res.discrepancy} extra check-ins)!`,
         )
       } else {
         showBanner(
           'success',
-          `📸 AI Photo Count for ${formatLessonHeading(session)}: ${res.photo_headcount} students counted (registered: ${res.registered_count}).`,
+          `🎯 YOLOv8 Photo Count for ${formatLessonHeading(session)}: ${res.photo_headcount} people detected (registered present: ${res.registered_count}).`,
         )
       }
     } catch (err) {
@@ -576,6 +588,13 @@ export default function LecturerDashboard() {
         photo_headcount: val,
         photo_analysis: val !== null ? `Manual headcount verification: ${val} students in room.` : null,
       })
+      if (val === null) {
+        setPhotoResultsByLesson((prev) => {
+          const next = { ...prev }
+          delete next[session.id]
+          return next
+        })
+      }
       setManualHeadcount('')
       await refresh()
     } catch (err) {
@@ -1161,13 +1180,13 @@ export default function LecturerDashboard() {
             </div>
           </section>
 
-          {/* Classroom Photo Headcount & Discrepancy Check Card */}
+          {/* Classroom Photo Headcount & Discrepancy Check Card (YOLOv8) */}
           <section className="card">
             <div className="card__header">
               <div>
-                <h2>📸 Classroom Photo Headcount (AI Vision)</h2>
+                <h2>📸 Classroom Photo Headcount (YOLOv8 Person Detection)</h2>
                 <p className="muted">
-                  Upload a photo of the lecture hall to automatically count seated students via Vision LLM and detect remote/proxy check-ins.
+                  Upload a classroom photo to detect and count people locally using <strong>YOLOv8</strong> (with visual bounding boxes) and spot proxy check-ins. No API key required.
                 </p>
               </div>
               {session && session.photo_headcount !== null && session.photo_headcount !== undefined && (
@@ -1176,7 +1195,7 @@ export default function LecturerDashboard() {
                     stats.present > session.photo_headcount ? 'badge--danger' : 'badge--success'
                   }`}
                 >
-                  Photo: {session.photo_headcount} vs. Present: {stats.present}
+                  YOLOv8: {session.photo_headcount} vs. Present: {stats.present}
                 </span>
               )}
             </div>
@@ -1197,21 +1216,114 @@ export default function LecturerDashboard() {
                 onClick={() => photoInputRef.current?.click()}
               >
                 {busyAction === 'photo-count'
-                  ? '🤖 Counting Students in Photo…'
+                  ? '🎯 Running YOLOv8 Person Detection…'
                   : '📷 Upload Classroom Photo (.jpg / .png)'}
-              </button>
-              <button
-                type="button"
-                className="btn btn--ghost btn--sm"
-                onClick={() => setAiSettingsOpen(true)}
-              >
-                ⚙️ Configure Vision API Key
               </button>
             </div>
 
+            {session && (() => {
+              const cachedPhoto = photoResultsByLesson[session.id]
+              const annotatedUrl =
+                cachedPhoto?.annotatedImage ||
+                (session.has_annotated_photo
+                  ? `/api/attendance/lessons/${session.id}/photo-annotated.jpg?pin=${encodeURIComponent(
+                      getStoredLecturerPin(),
+                    )}&t=${encodeURIComponent(session.photo_checked_at || '')}`
+                  : null)
+              if (!annotatedUrl && session.photo_headcount === null) return null
+
+              const counted = session.photo_headcount ?? cachedPhoto?.headcount ?? 0
+              const diff = stats.present - counted
+              return (
+                <div
+                  className="qr-url-box"
+                  style={{ marginTop: '0.85rem', width: '100%', textAlign: 'left' }}
+                >
+                  <div
+                    style={{
+                      display: 'flex',
+                      justifyContent: 'space-between',
+                      alignItems: 'center',
+                      flexWrap: 'wrap',
+                      gap: '0.5rem',
+                      marginBottom: annotatedUrl ? '0.6rem' : '0',
+                    }}
+                  >
+                    <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap', alignItems: 'center' }}>
+                      <span className="badge badge--info">
+                        🎯 YOLOv8 Counted: {counted} {counted === 1 ? 'person' : 'people'}
+                      </span>
+                      <span className="badge badge--muted">
+                        📋 Registered Present: {stats.present}
+                      </span>
+                      {diff > 0 ? (
+                        <span className="badge badge--danger">
+                          🚨 +{diff} Extra Check-in{diff === 1 ? '' : 's'}!
+                        </span>
+                      ) : (
+                        <span className="badge badge--success">
+                          ✓ Verified ({counted >= stats.present ? 'No extra check-ins' : 'Match'})
+                        </span>
+                      )}
+                    </div>
+                    {annotatedUrl && (
+                      <button
+                        type="button"
+                        className="btn btn--ghost btn--sm"
+                        onClick={() => setZoomedPhotoUrl(annotatedUrl)}
+                      >
+                        🔍 Enlarge Photo
+                      </button>
+                    )}
+                  </div>
+
+                  {annotatedUrl && (
+                    <div
+                      style={{
+                        borderRadius: '8px',
+                        overflow: 'hidden',
+                        border: '1px solid rgba(16, 185, 129, 0.45)',
+                        background: '#0f172a',
+                        cursor: 'zoom-in',
+                      }}
+                      onClick={() => setZoomedPhotoUrl(annotatedUrl)}
+                      title="Click to enlarge YOLOv8 annotated classroom photo"
+                    >
+                      <img
+                        src={annotatedUrl}
+                        alt={`YOLOv8 annotated classroom photo (${counted} people detected)`}
+                        style={{
+                          display: 'block',
+                          width: '100%',
+                          maxHeight: '340px',
+                          objectFit: 'contain',
+                        }}
+                      />
+                    </div>
+                  )}
+
+                  {cachedPhoto?.detections?.length > 0 && (
+                    <div style={{ marginTop: '0.5rem', display: 'flex', gap: '0.35rem', flexWrap: 'wrap' }}>
+                      {cachedPhoto.detections.map((d) => (
+                        <span key={d.index} className="badge badge--success badge--tiny">
+                          Person #{d.index}: {Math.round(d.confidence * 100)}%
+                        </span>
+                      ))}
+                    </div>
+                  )}
+
+                  {session.photo_analysis && (
+                    <p className="muted" style={{ marginTop: '0.45rem', marginBottom: 0, fontSize: '0.84rem' }}>
+                      {session.photo_analysis}
+                    </p>
+                  )}
+                </div>
+              )
+            })()}
+
             {session && (
               <form className="context-subform" style={{ marginTop: '0.75rem' }} onSubmit={handleManualHeadcountSave}>
-                <span className="context-subform__tag">Or set headcount manually:</span>
+                <span className="context-subform__tag">Or override headcount manually:</span>
                 <input
                   type="number"
                   min={0}
@@ -1232,12 +1344,6 @@ export default function LecturerDashboard() {
                   Apply Count
                 </button>
               </form>
-            )}
-
-            {session?.photo_analysis && (
-              <p className="muted" style={{ marginTop: '0.6rem' }}>
-                <strong>Last Count Result:</strong> {session.photo_analysis}
-              </p>
             )}
           </section>
 
@@ -1593,6 +1699,50 @@ export default function LecturerDashboard() {
           </div>
         )}
       </section>
+
+      {/* Full-Size Lightbox Modal for Annotated YOLOv8 Photo */}
+      {zoomedPhotoUrl && (
+        <div
+          className="modal-backdrop"
+          onClick={() => setZoomedPhotoUrl(null)}
+          role="dialog"
+          aria-modal="true"
+          aria-label="Annotated YOLOv8 Classroom Photo"
+        >
+          <div
+            className="card"
+            style={{ maxWidth: '92vw', maxHeight: '90vh', padding: '0.85rem', overflow: 'auto' }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="card__header" style={{ marginBottom: '0.5rem' }}>
+              <div>
+                <h2 style={{ margin: 0 }}>
+                  🎯 YOLOv8 Detection Result — {session ? formatLessonHeading(session) : 'Classroom Photo'}
+                </h2>
+                {session?.photo_analysis && <p className="muted" style={{ margin: 0 }}>{session.photo_analysis}</p>}
+              </div>
+              <button
+                type="button"
+                className="btn btn--secondary btn--sm"
+                onClick={() => setZoomedPhotoUrl(null)}
+              >
+                ✕ Close
+              </button>
+            </div>
+            <img
+              src={zoomedPhotoUrl}
+              alt="Full-size YOLOv8 annotated classroom photo"
+              style={{
+                display: 'block',
+                maxWidth: '88vw',
+                maxHeight: '78vh',
+                margin: '0 auto',
+                borderRadius: '8px',
+              }}
+            />
+          </div>
+        </div>
+      )}
     </div>
   )
 }
